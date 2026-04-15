@@ -33,8 +33,11 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
+  # MAX_ITERATIONS bounds the runaway-comment count — each auto-fix run
+  # posts one PR comment with Claude's proposal; if the CTO applies and
+  # CI fails again, subsequent runs append. After MAX_ITERATIONS comments,
+  # the workflow labels `needs-human` and stops proposing.
   MAX_ITERATIONS: 5
-  MAX_BUDGET_USD: "2.00"
 
 jobs:
   auto-fix:
@@ -60,12 +63,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
       - name: Install tools
+        # pyyaml for the Python context-collection step below.
+        # No Java/Node setup is needed anymore — the human-in-loop flow does
+        # not auto-apply fixes, so there's no in-CI verification to run.
         run: pip install -q pyyaml
 
       - name: Guard — check iteration count
@@ -201,138 +202,105 @@ jobs:
             fs.writeFileSync('failed-jobs.json', JSON.stringify(summaries, null, 2));
             core.info(`Collected logs from ${summaries.length} failed job(s)`);
 
-      - name: Dual-LLM judge (Claude + Codex direct API)
+      - name: Claude fix proposal (human-in-the-loop)
         if: steps.guard.outputs.max_reached == 'false'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          FIX_MAX_BUDGET_USD: ${{ env.MAX_BUDGET_USD }}
-        # Direct HTTP calls to both providers. Avoids the workflow-validation
-        # guard of anthropics/claude-code-action@v1 which refuses to run when
-        # the PR branch differs from main's workflow — a hard blocker for
-        # generator-style CI edits. See pipeline/core/auto_fix_judge.py for the
-        # cross-validation logic: both models propose in parallel, we apply
-        # only when they agree (or when Claude is very confident and Codex
-        # escalates).
+        # Claude analyzes the failure and writes fix-proposal.json. This
+        # step NEVER applies the change — the CTO cross-validates the
+        # proposal (e.g., via /codex:review locally) and decides whether to
+        # apply manually. See pipeline/core/auto_fix_judge.py.
         run: python3 .ztd-platform/pipeline/core/auto_fix_judge.py
 
-      - name: Check if fixes were applied
+      - name: Post proposal + label for CTO cross-validation
         if: steps.guard.outputs.max_reached == 'false'
-        id: check
-        run: |
-          UNTRACKED="$(git ls-files --others --exclude-standard)"
-          if git diff --quiet && [ -z "$UNTRACKED" ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "[INFO] No changes applied"
-          else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "[INFO] Changes detected:"
-            git diff --stat
-            if [ -n "$UNTRACKED" ]; then
-              echo "[INFO] Untracked files:"
-              printf '%s\n' "$UNTRACKED"
-            fi
-          fi
-
-      - uses: actions/setup-node@v4
-        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
-        with:
-          node-version: "20"
-
-      - name: Install verification deps
-        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
-        run: |
-          pip install -q pyyaml jsonschema pytest
-
-      - name: Validate generated changes
-        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
-        run: python .github/scripts/validate_generated_changes.py
-
-      - name: Run focused verification
-        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
-        run: |
-          ROOT=$(python3 -c "
-          import yaml
-          with open('.pipeline/platform.yml') as f:
-              print(yaml.safe_load(f).get('project_root', '.'))
-          ")
-          CHANGED="$(git diff --name-only; git ls-files --others --exclude-standard)"
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/api/"; then
-            echo "[INFO] Verifying api changes"
-            python -m pip install -q -r "$ROOT/api/requirements.txt" 2>/dev/null || true
-            python -m pip install -q pytest pytest-timeout
-            (cd "$ROOT/api" && pytest -q tests/ --maxfail=1)
-          fi
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/sidecar/"; then
-            echo "[INFO] Verifying sidecar changes"
-            python -m pip install -q -r "$ROOT/sidecar/requirements.txt" 2>/dev/null || true
-            python -m pip install -q pytest pytest-timeout
-            if [ -d "$ROOT/sidecar/tests" ]; then
-              (cd "$ROOT/sidecar" && pytest -q tests/ --maxfail=1)
-            fi
-          fi
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/desktop/"; then
-            echo "[INFO] Verifying desktop changes"
-            (cd "$ROOT/desktop" && npm ci && npm run build)
-          fi
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/android/.*\\.kt$"; then
-            echo "[INFO] Verifying Android (Kotlin) changes"
-            if [ -d "$ROOT/android" ] && [ -f "$ROOT/android/gradlew" ]; then
-              chmod +x "$ROOT/android/gradlew"
-              (cd "$ROOT/android" && ./gradlew testDebugUnitTest --no-daemon --console=plain)
-            else
-              echo "[WARN] android/ or gradlew missing — skip Gradle verify"
-            fi
-          fi
-
-      - name: Commit and push fixes
-        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
-        run: |
-          NEXT="${{ steps.guard.outputs.next }}"
-          BRANCH="${{ inputs.branch }}"
-
-          git config user.name "claude-auto-fix[bot]"
-          git config user.email "claude-auto-fix[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "$(cat <<EOF
-          fix(auto): [fix ${NEXT}/${MAX_ITERATIONS}] CI auto-fix via 5-step judgment
-
-          Applied by ci-auto-fix.yml iteration ${NEXT}.
-          See fix-proposal.json artifact for details (includes Claude + Codex raw output and cross-validation reason).
-          EOF
-          )"
-          git push origin "HEAD:$BRANCH"
-
-      - name: Label needs-human if no fix possible
-        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'false'
         uses: actions/github-script@v7
         env:
           BRANCH: ${{ inputs.branch }}
+          ITER: ${{ steps.guard.outputs.next }}
+          MAX_ITER: ${{ env.MAX_ITERATIONS }}
         with:
           script: |
+            const fs = require('fs');
             const branch = process.env.BRANCH;
+            const iter = process.env.ITER;
+            const maxIter = process.env.MAX_ITER;
+
+            let proposal = null;
+            try {
+              proposal = JSON.parse(fs.readFileSync('fix-proposal.json', 'utf8'));
+            } catch (e) {
+              core.setFailed(`fix-proposal.json missing or invalid: ${e.message}`);
+              return;
+            }
+
+            const verdict = proposal.verdict || 'escalate';
+            const confidence = proposal.confidence ?? 0;
+            const specId = proposal.spec_id || 'none';
+            const reasoning = proposal.reasoning || '(no reasoning provided)';
+            const fix = proposal.fix;
+
+            let body;
+            if (verdict === 'propose_fix' && fix) {
+              body = [
+                `### 🤖 Auto-fix proposal (iteration ${iter}/${maxIter}) — needs CTO cross-validation`,
+                '',
+                `**Verdict**: \`${verdict}\` · **Confidence**: \`${confidence}\` · **Spec**: \`${specId}\``,
+                '',
+                '**Reasoning**',
+                '> ' + reasoning.replace(/\n/g, '\n> '),
+                '',
+                `**Proposed change** — \`${fix.file}\``,
+                '',
+                '```diff',
+                '- ' + (fix.before || '').split('\n').join('\n- '),
+                '+ ' + (fix.after || '').split('\n').join('\n+ '),
+                '```',
+                '',
+                '---',
+                '**How to cross-validate** (CTO):',
+                '1. Pull this branch locally.',
+                '2. Run `/codex:review` (or eyeball) against the proposed diff above.',
+                '3. If correct: apply the change (search for the `before` block, replace with `after`), commit, push.',
+                '4. If wrong: comment here with the corrected fix or resolve manually.',
+                '',
+                `*Full model output attached in the \`auto-fix-report\` artifact.*`,
+              ].join('\n');
+            } else {
+              body = [
+                `### 🤖 Auto-fix: escalate (iteration ${iter}/${maxIter})`,
+                '',
+                `**Confidence**: \`${confidence}\` — not high enough to propose a fix.`,
+                '',
+                '**Why the model escalated**',
+                '> ' + reasoning.replace(/\n/g, '\n> '),
+                '',
+                '`needs-human` label applied. Fix manually; see the `auto-fix-report` artifact for the full analysis.',
+              ].join('\n');
+            }
+
             const prs = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
               head: `${context.repo.owner}:${branch}`,
               state: 'open',
             });
+
             for (const pr of prs.data) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr.number,
-                labels: ['needs-human'],
-              });
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: pr.number,
-                body: '**Auto-fix engine** could not resolve the CI failure automatically.\n\nPlease review the failure logs and fix manually.',
+                body,
+              });
+              const labels = (verdict === 'propose_fix')
+                ? ['cross-validate-needed']
+                : ['needs-human'];
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels,
               });
             }
 

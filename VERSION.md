@@ -2,6 +2,17 @@
 
 SemVer. Major bumps require `BREAKING:` in the PR title and an entry in this file.
 
+## v0.1.0-alpha.3 (rolling — latest PR 3c-5, 2026-04-15)
+
+### PR 3c-5 — human-in-loop auto-fix
+- `pipeline/core/auto_fix_judge.py` rewritten: calls **Claude only**, always produces `fix-proposal.json`, **never applies changes**.
+- `ci-auto-fix.yml`: auto-apply / verify / auto-commit steps removed. Replaced with a `github-script` step that posts the proposal as a PR comment and labels the PR `cross-validate-needed` (on `propose_fix`) or `needs-human` (on `escalate`).
+- Rationale: GitHub Actions cannot use the CTO's ChatGPT OAuth for server-side Codex cross-validation, and a paid OpenAI API key is out of scope. The human is the second validator — Claude diagnoses, CTO approves via `/codex:review` locally or by eyeball, applies the diff by hand.
+- `setup-java`, Node/Gradle verification, and `validate_generated_changes.py` invocation dropped from the auto-fix job (no longer needed once auto-apply is gone).
+
+### PR 3c-4 — superseded by 3c-5
+- Added direct-HTTP dual-LLM judge (Claude + Codex) with cross-validation. Replaced because OpenAI API billing is not in scope. The `auto_fix_judge.py` skeleton is reused; the cross-validate branch is removed.
+
 ## v0.0.1-raw (2026-04-15)
 
 - Historical snapshot of workflows and pipeline assets before the `workflow_call` refactor.
