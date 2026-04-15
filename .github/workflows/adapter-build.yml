@@ -1,24 +1,46 @@
+# Adapter dispatcher: routes build to the correct platform adapter.
+# Called by consumer repos and internal callers with the adapter name from platform.yml.
+
 name: Adapter Build Dispatcher
 
 on:
   workflow_call:
     inputs:
       adapter:
-        description: "Adapter name from platform.yml (electron, android, etc.)"
+        description: "Adapter name from platform.yml (android, electron, web)"
         required: true
         type: string
       build_target:
-        description: "Build target: win, mac, linux, or all"
+        description: "Electron only — win, mac, linux, or all"
         required: false
         default: "all"
         type: string
+      build_type:
+        description: "Android only — debug or release"
+        required: false
+        default: "release"
+        type: string
       require_signing:
-        description: "Fail protected targets when signing secrets are missing"
+        description: "Electron only — fail protected targets when signing secrets are missing"
         required: false
         default: false
         type: boolean
+    outputs:
+      artifact_name:
+        description: "Name of the uploaded build artifact (adapter-specific)"
+        value: ${{ jobs.summary.outputs.artifact_name }}
+
+permissions:
+  contents: read
 
 jobs:
+  android-build:
+    if: inputs.adapter == 'android'
+    uses: ./.github/workflows/android-build.yml
+    with:
+      build_type: ${{ inputs.build_type }}
+    secrets: inherit
+
   electron-build:
     if: inputs.adapter == 'electron'
     uses: ./.github/workflows/electron-build.yml
@@ -27,11 +49,36 @@ jobs:
       require_signing: ${{ inputs.require_signing }}
     secrets: inherit
 
-  unsupported-adapter:
-    if: inputs.adapter != 'electron'
+  # Future adapters: add here with matching inputs.adapter == '<name>' gate.
+
+  summary:
     runs-on: ubuntu-latest
+    if: always()
+    needs: [android-build, electron-build]
+    outputs:
+      artifact_name: ${{ steps.pick.outputs.name }}
     steps:
-      - name: Fail unsupported adapter
+      - name: Pick artifact name from matched adapter
+        id: pick
         run: |
-          echo "::error::No build workflow is configured for adapter=${{ inputs.adapter }}"
-          exit 1
+          A="${{ needs.android-build.result }}"
+          E="${{ needs.electron-build.result }}"
+          case "${{ inputs.adapter }}" in
+            android)
+              [ "$A" = "success" ] || { echo "::error::android-build did not succeed ($A)"; exit 1; }
+              echo "name=${{ needs.android-build.outputs.aab_artifact_name }}" >> "$GITHUB_OUTPUT"
+              ;;
+            electron)
+              [ "$E" = "success" ] || { echo "::error::electron-build did not succeed ($E)"; exit 1; }
+              # electron-build does not currently emit a named output; leave blank.
+              echo "name=" >> "$GITHUB_OUTPUT"
+              ;;
+            web)
+              echo "::notice::web adapter has no build step"
+              echo "name=" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::unsupported adapter: ${{ inputs.adapter }}"
+              exit 1
+              ;;
+          esac

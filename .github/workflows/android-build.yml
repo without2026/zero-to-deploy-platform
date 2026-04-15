@@ -1,0 +1,104 @@
+# Android build — produces signed/unsigned AAB.
+# Reads .pipeline/platform.yml for project_root. The gradle project is expected
+# under <project_root>/ (the same layout as android-tests.yml).
+#
+# Outputs the AAB as an actions artifact named `android-aab` so downstream
+# workflows (sbom-sign, deploy-staging, deploy-production) can fetch it.
+
+name: Android Build
+
+on:
+  workflow_call:
+    inputs:
+      build_type:
+        description: "debug | release"
+        required: false
+        default: "release"
+        type: string
+      upload_artifact:
+        description: "Upload AAB as actions artifact"
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      aab_artifact_name:
+        description: "actions/upload-artifact name of the AAB (empty if upload_artifact=false)"
+        value: ${{ jobs.build.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  read-config:
+    runs-on: ubuntu-latest
+    outputs:
+      root: ${{ steps.config.outputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read project_root from platform.yml
+        id: config
+        run: |
+          pip install -q pyyaml
+          ROOT=$(python3 -c "import yaml; print(yaml.safe_load(open('.pipeline/platform.yml'))['project_root'])")
+          [ -n "$ROOT" ] || { echo "::error::project_root missing in platform.yml"; exit 1; }
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: read-config
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.name-out.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Gradle build
+        working-directory: ${{ needs.read-config.outputs.root }}
+        run: |
+          chmod +x ./gradlew 2>/dev/null || true
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            ./gradlew bundleRelease --no-daemon --console=plain
+          else
+            ./gradlew bundleDebug --no-daemon --console=plain
+          fi
+
+      - name: Resolve AAB path
+        id: aab
+        working-directory: ${{ needs.read-config.outputs.root }}
+        run: |
+          set -e
+          AAB=$(find app/build/outputs/bundle -name '*.aab' | head -1)
+          [ -n "$AAB" ] || { echo "::error::no .aab produced"; exit 1; }
+          echo "path=$AAB" >> "$GITHUB_OUTPUT"
+          sha256sum "$AAB" | cut -d' ' -f1 > "$AAB.sha256"
+          echo "sha256=$(cat "$AAB.sha256")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload AAB artifact
+        if: inputs.upload_artifact == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab
+          path: |
+            ${{ needs.read-config.outputs.root }}/${{ steps.aab.outputs.path }}
+            ${{ needs.read-config.outputs.root }}/${{ steps.aab.outputs.path }}.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Expose artifact name
+        id: name-out
+        if: inputs.upload_artifact == true
+        run: echo "name=android-aab" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Android Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "- build_type: ${{ inputs.build_type }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- AAB: ${{ steps.aab.outputs.path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- sha256: \`${{ steps.aab.outputs.sha256 }}\`" >> "$GITHUB_STEP_SUMMARY"
