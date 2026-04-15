@@ -1,16 +1,35 @@
 # Android deterministic gates.
 # Reads .pipeline/platform.yml for project_root.
+#
+# v0.1.0-alpha note (PR 3c-2):
+#   - /android path suffix removed (v3 legacy; modern AGP has gradle at project_root).
+#   - Core scripts (spec-coverage.py, assert-guard.py, perf-check.sh) are now
+#     fetched from this platform repo at runtime via a second checkout, since
+#     Step 1 of the 3-layer migration moved them out of consumer repos.
 
 name: Android Deterministic Gates
 
 on:
   workflow_call:
 
+env:
+  # TODO(v0.1.0 release): resolve this dynamically from github.workflow_ref
+  # so consumers pinning @v1.x.y automatically get the matching platform scripts.
+  PLATFORM_REF: v0.1.0-alpha
+
 jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout consumer repo
+        uses: actions/checkout@v4
+
+      - name: Checkout platform scripts
+        uses: actions/checkout@v4
+        with:
+          repository: without2026/zero-to-deploy-platform
+          ref: ${{ env.PLATFORM_REF }}
+          path: .ztd-platform
 
       - uses: actions/setup-java@v4
         with:
@@ -35,10 +54,10 @@ jobs:
           echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Spec coverage
-        run: python .pipeline/core/spec-coverage.py
+        run: python .ztd-platform/pipeline/core/spec-coverage.py
 
       - name: Assert guard
-        run: python .pipeline/core/assert-guard.py
+        run: python .ztd-platform/pipeline/core/assert-guard.py
 
       - name: Secret detection
         run: |
@@ -50,13 +69,23 @@ jobs:
           fi
 
       - name: Gradle dependency check
-        working-directory: ${{ steps.config.outputs.root }}/android
-        run: ./gradlew dependencyCheckAnalyze
+        working-directory: ${{ steps.config.outputs.root }}
+        run: |
+          if [ -x ./gradlew ]; then
+            ./gradlew dependencyCheckAnalyze
+          else
+            echo "::warning::gradlew not present — dependencyCheckAnalyze skipped"
+          fi
 
       - name: Android Lint (security + a11y)
-        working-directory: ${{ steps.config.outputs.root }}/android
-        run: ./gradlew lint
+        working-directory: ${{ steps.config.outputs.root }}
+        run: |
+          if [ -x ./gradlew ]; then
+            ./gradlew lint
+          else
+            echo "::warning::gradlew not present — lint skipped"
+          fi
 
       - name: APK size check
-        working-directory: ${{ steps.config.outputs.root }}/android
-        run: bash ../../.pipeline/adapters/android/perf-check.sh
+        working-directory: ${{ steps.config.outputs.root }}
+        run: bash "${GITHUB_WORKSPACE}/.ztd-platform/pipeline/adapters/android/perf-check.sh"

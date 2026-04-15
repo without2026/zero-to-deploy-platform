@@ -8,6 +8,16 @@ SemVer. Major bumps require `BREAKING:` in the PR title and an entry in this fil
 - **Not consumable** by external callers — workflows still use `on: pull_request/push` triggers.
 - Purpose: establish a pre-refactor baseline for diff/audit.
 
+## v0.1.0-alpha.2 (2026-04-15) — planned
+
+PR 3c-2: bugs surfaced by the `ztd-smoke-hello` smoke run, fixed.
+
+- **Bug A — `/android` path hardcode removed** from `android-tests.yml` and `android-gates.yml`. Modern AGP consumer apps have the gradle project at `project_root` directly; v3-legacy layout (`project_root/android/`) no longer assumed. Consumers with legacy layout should set `project_root: <path>/android` in `platform.yml` explicitly.
+- **Bug B — core scripts fetched at runtime** via a second `actions/checkout` of this platform repo into `.ztd-platform/`. Affected jobs: `android-gates`, `electron-gates`, `web-gates`. Script calls now use `.ztd-platform/pipeline/core/*.py` and `.ztd-platform/.github/scripts/coverage-delta.py`. Step-1 migration (moving `.pipeline/core` out of consumer repos) is now wired end-to-end.
+- **Gradle wrapper fallback** in `android-tests.yml`: if consumer lacks `./gradlew`, download gradle 8.7 at runtime and use it directly. Instrumented tests gracefully skip (with warning) when wrapper absent — they require on-device perms the fallback can't provide.
+- Platform visibility flipped from PRIVATE → PUBLIC (GitHub Free plan does not allow cross-repo consumption of reusable workflows from private repos). Runtime data (secrets, logs, artifacts) of consumer apps remain private; only workflow DEFINITIONS become public.
+- `PLATFORM_REF: v0.1.0-alpha` is currently hardcoded in the platform-checkout steps. TODO(v0.1.0): parse from `github.workflow_ref` so consumers pinning `@v1.x.y` get the matching scripts automatically.
+
 ## v0.1.0-alpha (2026-04-15)
 
 First consumable tag for smoke testing. **Pre-release** — do not use in production.
