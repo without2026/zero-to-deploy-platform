@@ -2,7 +2,14 @@
 
 SemVer. Major bumps require `BREAKING:` in the PR title and an entry in this file.
 
-## v0.1.0-alpha.3 (rolling — latest PR 3c-6, 2026-04-15)
+## v0.1.0-alpha.3 (rolling — latest PR 3c-7, 2026-04-15)
+
+### PR 3c-7 — branch-protection context drift fix
+The skill template `tools/setup-branch-protection.sh.tmpl` previously hardcoded context names like `"Adapter Tests / android-unit"` and `"CI Review Pipeline / merge-gate"` — contexts that either never existed or were removed in PR 3c-6. Any app that ran the generated script got branch protection with permanently-waiting required checks; the only escape was to disable protection (defeating Q3 entirely).
+
+Fix: contexts now list only the two roll-up jobs (`tests / test-result`, `gates / gate-result`) that are adapter-agnostic and match GitHub's real check-suite naming. Additional security checks (SAST, SCA, SBOM) will be appended when those workflows ship.
+
+
 
 ### PR 3c-6 — strip all LLM-in-CI
 CI becomes deterministic only. All LLM-based work (review, auto-fix, scenario-gen, incident-regression spec writing) moves to the CTO's local Claude Code session, where Claude Opus proposes + implements and `/codex:adversarial-review` cross-validates using the CTO's ChatGPT subscription.
