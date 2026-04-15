@@ -8,6 +8,19 @@ SemVer. Major bumps require `BREAKING:` in the PR title and an entry in this fil
 - **Not consumable** by external callers — workflows still use `on: pull_request/push` triggers.
 - Purpose: establish a pre-refactor baseline for diff/audit.
 
+## v0.1.0-alpha (2026-04-15)
+
+First consumable tag for smoke testing. **Pre-release** — do not use in production.
+
+- Three reusable workflows confirmed ready for consumption via `@v0.1.0-alpha`:
+  - `ci-review.yml` — converted to dual-mode (`pull_request` + `workflow_call`)
+  - `adapter-tests.yml` — already dispatcher-style workflow_call (from legacy)
+  - `adapter-gates.yml` — already dispatcher-style workflow_call (from legacy)
+- `workflow-call-audit` self-CI gate now shows 4 missing (was 5) — remaining:
+  `ci-auto-fix.yml`, `ci-scenario-gen.yml`, `deploy-staging.yml`, `deploy-production.yml`.
+  These are deferred to PR 3c-2.
+- Known gaps documented in `docs/plans/e2e-readiness-trace.md` (skill repo).
+
 ## In progress — toward v0.1.0
 
 ### Step 3b (feat/3b-workflow-audit-selfci) — 2026-04-15
