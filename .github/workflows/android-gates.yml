@@ -87,5 +87,12 @@ jobs:
           fi
 
       - name: APK size check
-        working-directory: ${{ steps.config.outputs.root }}
+        # perf-check.sh expects CWD = repo root (find paths start with
+        # `${project_root}/build/...`). Do NOT override working-directory.
+        # Also: the script hard-codes `app/build/...` — when project_root !=
+        # "app", consumers should either (a) set project_root = "app" or
+        # (b) wait for the v0.1.0 refactor of perf-check.sh to accept
+        # PROJECT_ROOT env var.
+        env:
+          PROJECT_ROOT: ${{ steps.config.outputs.root }}
         run: bash "${GITHUB_WORKSPACE}/.ztd-platform/pipeline/adapters/android/perf-check.sh"
