@@ -11,9 +11,18 @@
 
 name: CI Review Pipeline
 
+# Dual-mode:
+#   - `pull_request:` preserved for legacy in-repo behavior (platform-repo self-CI).
+#   - `workflow_call:` so consumer apps can invoke via caller stubs (@v1).
+# When called from a consumer's caller stub that itself runs on pull_request,
+# `github.event.pull_request.*` resolves from the caller's context (GitHub's
+# workflow_call inheritance).
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_call:
+    # No explicit inputs — this workflow reads everything from the PR event
+    # inherited from the caller. Secrets must be passed via `secrets: inherit`.
 
 permissions:
   contents: read
