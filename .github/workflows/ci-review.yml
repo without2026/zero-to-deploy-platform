@@ -21,8 +21,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_call:
-    # No explicit inputs — this workflow reads everything from the PR event
-    # inherited from the caller. Secrets must be passed via `secrets: inherit`.
+    inputs:
+      platform_ref:
+        description: "Ref of zero-to-deploy-platform for runtime scripts (e.g. cross_validator.py). Optional: defaults to 'main' for platform-repo self-CI."
+        required: false
+        type: string
+        default: "main"
+    # github.event.pull_request.* resolves from the caller's context via
+    # workflow_call inheritance. Secrets must be passed via `secrets: inherit`.
 
 permissions:
   contents: read
@@ -245,6 +251,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout platform scripts
+        uses: actions/checkout@v4
+        with:
+          repository: without2026/zero-to-deploy-platform
+          ref: ${{ inputs.platform_ref || 'main' }}
+          path: .ztd-platform
+
       - uses: actions/download-artifact@v4
         with:
           name: claude-review
@@ -322,7 +335,7 @@ jobs:
           fi
 
       - name: Cross validate
-        run: python .github/scripts/cross_validator.py
+        run: python .ztd-platform/.github/scripts/cross_validator.py
 
       - uses: actions/upload-artifact@v4
         with:
