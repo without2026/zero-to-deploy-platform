@@ -28,6 +28,8 @@ permissions:
   contents: write
   pull-requests: write
   actions: read
+  # OIDC for claude-code-action authentication
+  id-token: write
 
 env:
   PYTHON_VERSION: "3.12"
