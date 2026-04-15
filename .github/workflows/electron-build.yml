@@ -14,11 +14,15 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
 jobs:
-  read-config:
+  setup:
     runs-on: ubuntu-latest
     outputs:
       root: ${{ steps.config.outputs.root }}
+      matrix: ${{ steps.matrix.outputs.json }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,28 +31,30 @@ jobs:
       - name: Read project_root
         id: config
         run: |
-          pip install -q pyyaml 2>/dev/null || true
-          PROJECT_ROOT=$(python3 -c "
-          import yaml
-          with open('.pipeline/platform.yml') as f:
-              print(yaml.safe_load(f).get('project_root', '.'))
-          ")
+          pip install -q pyyaml
+          PROJECT_ROOT=$(python3 -c "import yaml; print(yaml.safe_load(open('.pipeline/platform.yml')).get('project_root', '.'))")
           echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+      - name: Compute filtered matrix
+        id: matrix
+        env:
+          BUILD_TARGET: ${{ inputs.build_target }}
+        run: |
+          ALL='[{"os":"ubuntu-latest","target":"linux"},{"os":"windows-latest","target":"win"},{"os":"macos-14","target":"mac"}]'
+          case "$BUILD_TARGET" in
+            all)   JSON="$ALL" ;;
+            linux) JSON='[{"os":"ubuntu-latest","target":"linux"}]' ;;
+            win)   JSON='[{"os":"windows-latest","target":"win"}]' ;;
+            mac)   JSON='[{"os":"macos-14","target":"mac"}]' ;;
+            *)     echo "::error::invalid build_target: $BUILD_TARGET (expected all|linux|win|mac)"; exit 1 ;;
+          esac
+          echo "json={\"include\":$JSON}" >> "$GITHUB_OUTPUT"
 
   build-desktop:
-    needs: read-config
+    needs: setup
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux
-          - os: windows-latest
-            target: win
-          - os: macos-14
-            target: mac
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    if: inputs.build_target == 'all' || inputs.build_target == matrix.target
     steps:
       - uses: actions/checkout@v4
 
@@ -57,11 +63,11 @@ jobs:
           node-version: "20"
 
       - name: Install deps
-        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        working-directory: ${{ needs.setup.outputs.root }}/desktop
         run: npm ci
 
       - name: Build renderer
-        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        working-directory: ${{ needs.setup.outputs.root }}/desktop
         run: npm run build
 
       - name: Verify signing prerequisites
@@ -72,18 +78,19 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
         run: |
-          if [ "${{ matrix.target }}" = "win" ] && { [ -z "$CSC_LINK" ] || [ -z "$CSC_KEY_PASSWORD" ]; }; then
+          if [ "$TARGET" = "win" ] && { [ -z "$CSC_LINK" ] || [ -z "$CSC_KEY_PASSWORD" ]; }; then
             echo "::error::Windows signing is required but CSC_LINK/CSC_KEY_PASSWORD is missing"
             exit 1
           fi
-          if [ "${{ matrix.target }}" = "mac" ] && { [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; }; then
+          if [ "$TARGET" = "mac" ] && { [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; }; then
             echo "::error::macOS signing/notarization is required but Apple signing secrets are missing"
             exit 1
           fi
 
       - name: Package installer
-        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        working-directory: ${{ needs.setup.outputs.root }}/desktop
         run: npx electron-builder --${{ matrix.target }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,26 +104,18 @@ jobs:
         with:
           name: desktop-${{ matrix.target }}
           path: |
-            ${{ needs.read-config.outputs.root }}/desktop/dist/*.exe
-            ${{ needs.read-config.outputs.root }}/desktop/dist/*.dmg
-            ${{ needs.read-config.outputs.root }}/desktop/dist/*.AppImage
-            ${{ needs.read-config.outputs.root }}/desktop/dist/*.deb
+            ${{ needs.setup.outputs.root }}/desktop/dist/*.exe
+            ${{ needs.setup.outputs.root }}/desktop/dist/*.dmg
+            ${{ needs.setup.outputs.root }}/desktop/dist/*.AppImage
+            ${{ needs.setup.outputs.root }}/desktop/dist/*.deb
           if-no-files-found: error
 
   build-sidecar:
-    needs: read-config
-    runs-on: ${{ matrix.os }}
+    needs: setup
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux
-          - os: windows-latest
-            target: win
-          - os: macos-14
-            target: mac
-    if: inputs.build_target == 'all' || inputs.build_target == matrix.target
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -125,7 +124,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps & build sidecar
-        working-directory: ${{ needs.read-config.outputs.root }}
+        working-directory: ${{ needs.setup.outputs.root }}
         run: |
           pip install pyinstaller
           pip install -r sidecar/requirements.txt 2>/dev/null || true
@@ -134,5 +133,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sidecar-${{ matrix.target }}
-          path: ${{ needs.read-config.outputs.root }}/dist/becalm-sidecar*
+          path: ${{ needs.setup.outputs.root }}/dist/becalm-sidecar*
           if-no-files-found: error
