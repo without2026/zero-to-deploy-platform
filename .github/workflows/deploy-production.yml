@@ -360,180 +360,35 @@ jobs:
   # On rollback, analyze failure and create fix PR with
   # incident-regression spec + regression test.
   # ──────────────────────────────────────────────
+  # Timing E: Incident Regression (notification only)
+  # LLM-based regression-spec generation was removed in PR 3c-6.
+  # CTO handles incident regression locally via Claude Code (Claude Opus +
+  # /codex:adversarial-review cross-validate). This job just flags the
+  # rollback via a repository_dispatch event.
+  # ──────────────────────────────────────────────
   incident-regression:
-    needs: [load-config, rollback]
+    needs: [rollback]
     if: inputs.promote_existing_prerelease == false && always() && needs.rollback.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install tools
-        run: pip install -q pyyaml
-
-      - name: Collect incident context
-        run: |
-          python3 << 'PYEOF'
-          import json, pathlib, yaml, subprocess
-
-          config = yaml.safe_load(pathlib.Path(".pipeline/platform.yml").read_text())
-          project_root = config.get("project_root", ".")
-          spec_dir = config.get("spec", {}).get("dir", ".spec")
-
-          recent_commits = subprocess.run(
-              ["git", "log", "--oneline", "-10"],
-              capture_output=True, text=True
-          ).stdout.strip()
-
-          context = {
-              "trigger": "production_smoke_failure",
-              "version": "${{ inputs.version }}",
-              "project_root": project_root,
-              "spec_dir": spec_dir,
-              "recent_commits": recent_commits,
-              "rollback_status": "completed",
-              "authority_file": ".pipeline/core/authority.yml",
-              "spec_template": ".spec/_template.spec.yml",
-          }
-          pathlib.Path("incident-context.json").write_text(json.dumps(context, indent=2))
-          PYEOF
-
-      - name: Timing E — Generate incident regression spec + test
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
-            You are the Timing E Incident Regression Engine.
-
-            A production deployment just failed and was rolled back.
-
-            ## Context
-            - incident-context.json: deployment details, recent commits
-            - .pipeline/core/authority.yml: source authority hierarchy
-
-            ## Your task
-            1. Analyze the recent commits to identify the likely cause of the production failure
-            2. Create a new `.spec/` entry with `source: incident-regression` (highest authority)
-               - Include `incident_log` field with the deployment failure context
-               - Use the spec template at .spec/_template.spec.yml
-            3. Create a regression test that would catch this failure
-               - Include `# spec: {ID}` comment referencing the new spec entry
-            4. Do NOT modify existing production code (this is just the spec + test)
-
-            ## Output
-            Create incident-report.json:
-            {
-              "spec_id": "...",
-              "spec_file": "...",
-              "test_file": "...",
-              "description": "...",
-              "likely_cause": "..."
-            }
-          claude_args: >-
-            --model claude-sonnet-4-6
-            --max-turns 10
-            --max-budget-usd 1.50
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install verification deps
-        run: |
-          pip install -q pyyaml jsonschema pytest
-
-      - name: Validate incident artifacts
-        run: python .github/scripts/validate_generated_changes.py
-
-      - name: Verify generated regression tests
-        run: |
-          ROOT=$(python3 -c "
-          import yaml
-          with open('.pipeline/platform.yml') as f:
-              print(yaml.safe_load(f).get('project_root', '.'))
-          ")
-          CHANGED="$(git diff --name-only; git ls-files --others --exclude-standard)"
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/api/tests/"; then
-            python -m pip install -q -r "$ROOT/api/requirements.txt" 2>/dev/null || true
-            python -m pip install -q pytest pytest-timeout
-            CHANGED_TESTS=$(printf '%s\n' "$CHANGED" | rg "^${ROOT}/api/tests/.*\\.py$")
-            if [ -n "$CHANGED_TESTS" ]; then
-              (cd "$ROOT/api" && pytest -q --maxfail=1 $(printf '%s\n' "$CHANGED_TESTS" | sed "s#^${ROOT}/api/##"))
-            fi
-          fi
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/sidecar/tests/"; then
-            python -m pip install -q -r "$ROOT/sidecar/requirements.txt" 2>/dev/null || true
-            python -m pip install -q pytest pytest-timeout
-            CHANGED_TESTS=$(printf '%s\n' "$CHANGED" | rg "^${ROOT}/sidecar/tests/.*\\.py$")
-            if [ -n "$CHANGED_TESTS" ]; then
-              (cd "$ROOT/sidecar" && pytest -q --maxfail=1 $(printf '%s\n' "$CHANGED_TESTS" | sed "s#^${ROOT}/sidecar/##"))
-            fi
-          fi
-
-          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/desktop/"; then
-            (cd "$ROOT/desktop" && npm ci && npm run build)
-          fi
-
-      - name: Create incident fix branch + PR
-        run: |
-          BRANCH="fix/incident-${{ inputs.version }}-$(date +%s)"
-          git config user.name "claude-incident[bot]"
-          git config user.email "claude-incident[bot]@users.noreply.github.com"
-
-          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
-            echo "[INFO] No incident artifacts generated — skipping PR"
-            exit 0
-          fi
-
-          git checkout -b "$BRANCH"
-          git add -A
-          git commit -m "$(cat <<EOF
-          test(incident): regression spec + test for ${{ inputs.version }} rollback
-
-          Timing E: auto-generated after production smoke failure.
-          Source: incident-regression (highest authority, immutable).
-          Requires CTO manual approval to merge.
-          EOF
-          )"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --base main \
-            --head "$BRANCH" \
-            --title "fix(incident): regression test for ${{ inputs.version }} rollback" \
-            --body "$(cat <<'PREOF'
-          ## Incident Regression (Timing E)
-
-          Production deployment of ${{ inputs.version }} failed smoke tests and was rolled back.
-
-          This PR adds:
-          - New `.spec/` entry with `source: incident-regression` (immutable, highest authority)
-          - Regression test to prevent this failure from recurring
-
-          **This PR requires CTO manual approval. Auto-merge is disabled for Timing E fixes.**
-          PREOF
-          )" \
-            --label "needs-human,incident-regression"
+      - name: Dispatch incident-regression-needed
+        uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload incident report
-        if: always()
-        uses: actions/upload-artifact@v4
+          VERSION: ${{ inputs.version }}
         with:
-          name: incident-report
-          path: |
-            incident-report.json
-            incident-context.json
-          if-no-files-found: ignore
+          script: |
+            const version = process.env.VERSION;
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'incident-regression-needed',
+              client_payload: {
+                version: version,
+                run_id: context.runId,
+                trigger: 'production_smoke_failure_rollback',
+              },
+            });
+            core.notice(`incident-regression-needed dispatch sent for version ${version}; CTO should resume orchestrator locally.`);
 
   promote-release:
     needs: [load-config]
