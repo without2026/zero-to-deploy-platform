@@ -80,7 +80,11 @@ def _normalize_index_specs(index: dict) -> tuple[set[str], dict[str, set[str]]]:
 
 
 def _collect_spec_ids(spec_dir: pathlib.Path, index: dict) -> tuple[dict[str, dict], dict[str, str]]:
-    """Parse all .spec/*.spec.yml and return ({id: behavior_dict}, {id: source_spec_file})."""
+    """Parse all .spec/*.spec.yml. Collect both `behaviors[]` and `invariants[]` —
+    invariants are testable assertions too (a one-per-module module-level rule)
+    and should require at least one test that references their ID, same as a
+    behavior. Returns ({id: spec_entry}, {id: source_spec_file}).
+    """
     behaviors: dict[str, dict] = {}
     sources: dict[str, str] = {}
     if not spec_dir.exists():
@@ -88,16 +92,23 @@ def _collect_spec_ids(spec_dir: pathlib.Path, index: dict) -> tuple[dict[str, di
 
     for spec_file in sorted(spec_dir.glob("*.spec.yml")):
         data = _load_yaml(spec_file)
-        for b in data.get("behaviors", []):
-            bid = b.get("id")
-            if not bid:
-                continue
-            if bid in behaviors:
-                prev = sources.get(bid, "(unknown)")
-                print(f"[BLOCK] Duplicate spec behavior ID '{bid}' in {spec_file} (already defined in {prev})")
-                sys.exit(2)
-            behaviors[bid] = b
-            sources[bid] = str(spec_file.relative_to(spec_dir.parent))
+        # Behaviors and invariants share the same ID namespace and the same
+        # test-coverage contract; collect both into the single map.
+        for kind in ("behaviors", "invariants"):
+            for entry in data.get(kind, []):
+                bid = entry.get("id")
+                if not bid:
+                    continue
+                if bid in behaviors:
+                    prev = sources.get(bid, "(unknown)")
+                    print(f"[BLOCK] Duplicate spec ID '{bid}' in {spec_file} (already defined in {prev})")
+                    sys.exit(2)
+                # Preserve the origin kind so downstream reporting can say
+                # "behavior" vs "invariant" without re-parsing.
+                enriched = dict(entry)
+                enriched.setdefault("_kind", kind.rstrip("s"))
+                behaviors[bid] = enriched
+                sources[bid] = str(spec_file.relative_to(spec_dir.parent))
 
     _enforce_index_rules(spec_dir, index, behaviors, sources)
     return behaviors, sources
@@ -212,7 +223,14 @@ def _scan_with_glob(
         if not globs:
             continue
         escaped = re.escape(str(comment_prefix).strip())
-        pattern = re.compile(rf"{escaped}\s*([\w]+-[\w]+)")
+        # Spec IDs are hyphenated tokens of 2 or more parts. Common shapes:
+        #   2-part: HELLO-001, AUTH-LOGIN
+        #   3-part: HELLO-INV-001, AUTH-LOGIN-001
+        #   4-part: TODO-SHARE-CONCURRENT-001
+        # The prior regex captured only the first two parts, silently
+        # truncating longer IDs and producing "non-existent spec" warnings
+        # for correctly-referenced invariants.
+        pattern = re.compile(rf"{escaped}\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)")
 
         for file_glob in globs:
             for test_path in project_dir.glob(file_glob):
@@ -234,7 +252,8 @@ def _compile_comment_patterns(comment_patterns: dict[str, str]) -> list[re.Patte
     patterns: list[re.Pattern[str]] = []
     for prefix in comment_patterns.values():
         escaped = re.escape(prefix.strip())
-        patterns.append(re.compile(rf"{escaped}\s*([\w]+-[\w]+)"))
+        # Same N-part-ID regex as _scan_with_glob (see note there).
+        patterns.append(re.compile(rf"{escaped}\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)"))
     return patterns
 
 
