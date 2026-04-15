@@ -6,20 +6,16 @@ name: Web Deterministic Gates
 
 on:
   workflow_call:
+    inputs:
+      platform_ref:
+        description: "Ref of zero-to-deploy-platform for runtime scripts."
+        required: true
+        type: string
 
 jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve platform ref from workflow_ref
-        id: platform_ref
-        run: |
-          REF="${{ github.workflow_ref }}"
-          TAIL="${REF##*@}"
-          TAIL="${TAIL#refs/heads/}"
-          TAIL="${TAIL#refs/tags/}"
-          echo "ref=${TAIL}" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -28,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: without2026/zero-to-deploy-platform
-          ref: ${{ steps.platform_ref.outputs.ref }}
+          ref: ${{ inputs.platform_ref }}
           path: .ztd-platform
 
       - uses: actions/setup-python@v5

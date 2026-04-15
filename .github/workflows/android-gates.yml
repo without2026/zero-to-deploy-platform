@@ -11,24 +11,16 @@ name: Android Deterministic Gates
 
 on:
   workflow_call:
+    inputs:
+      platform_ref:
+        description: "Ref of without2026/zero-to-deploy-platform for runtime scripts. Must match the tag/sha used in caller's `uses:` line."
+        required: true
+        type: string
 
 jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve platform ref from workflow_ref
-        id: platform_ref
-        # github.workflow_ref: <owner>/<repo>/.github/workflows/<file>@<ref>
-        # where <ref> is refs/heads/<branch>, refs/tags/<tag>, or a full SHA.
-        # Consumers pinning @vX.Y.Z get matching scripts automatically.
-        run: |
-          REF="${{ github.workflow_ref }}"
-          TAIL="${REF##*@}"
-          TAIL="${TAIL#refs/heads/}"
-          TAIL="${TAIL#refs/tags/}"
-          echo "ref=${TAIL}" >> "$GITHUB_OUTPUT"
-          echo "::notice::Resolved platform ref: ${TAIL}"
-
       - name: Checkout consumer repo
         uses: actions/checkout@v4
 
@@ -36,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: without2026/zero-to-deploy-platform
-          ref: ${{ steps.platform_ref.outputs.ref }}
+          ref: ${{ inputs.platform_ref }}
           path: .ztd-platform
 
       - uses: actions/setup-java@v4
