@@ -10,6 +10,11 @@ on:
         description: "Adapter name from platform.yml (electron, android, etc.)"
         required: true
         type: string
+      platform_ref:
+        description: "Ref of zero-to-deploy-platform for runtime scripts. Accepted for consistency with adapter-gates; current test workflows don't fetch platform scripts directly, but forward anyway to keep the consumer contract symmetric."
+        required: false
+        type: string
+        default: ""
 
 jobs:
   electron-tests:
