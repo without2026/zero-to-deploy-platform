@@ -11,9 +11,18 @@
 name: CI Auto-Fix Loop
 
 on:
-  workflow_run:
-    workflows: ["CI Review Pipeline"]
-    types: [completed]
+  # workflow_call: invoked by consumer pr.yml with `if: failure()` after
+  # tests/gates/review fail. Consumer owns the "should we auto-fix" decision.
+  workflow_call:
+    inputs:
+      platform_ref:
+        description: "Ref of zero-to-deploy-platform for runtime scripts (must match uses: tag)."
+        required: true
+        type: string
+      branch:
+        description: "PR head branch to check out and fix. Usually github.head_ref."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,18 +36,23 @@ env:
 
 jobs:
   auto-fix:
-    if: >-
-      github.event.workflow_run.conclusion == 'failure'
-      && !startsWith(github.event.workflow_run.head_branch, 'claude-fix-')
-      && github.event.workflow_run.event == 'pull_request'
+    # Skip self-authored auto-fix branches to prevent infinite loop.
+    if: ${{ !startsWith(inputs.branch, 'claude-fix-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_branch }}
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout platform scripts
+        uses: actions/checkout@v4
+        with:
+          repository: without2026/zero-to-deploy-platform
+          ref: ${{ inputs.platform_ref }}
+          path: .ztd-platform
 
       - uses: actions/setup-python@v5
         with:
@@ -74,12 +88,15 @@ jobs:
       - name: Label needs-human if max iterations
         if: steps.guard.outputs.max_reached == 'true'
         uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ inputs.branch }}
         with:
           script: |
+            const branch = process.env.BRANCH;
             const prs = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              head: `${context.repo.owner}:${context.payload.workflow_run.head_branch}`,
+              head: `${context.repo.owner}:${branch}`,
               state: 'open',
             });
             for (const pr of prs.data) {
@@ -119,8 +136,8 @@ jobs:
               "ci_adapter": config.get("ci", {}).get("adapter", "electron"),
               "specs": specs,
               "spec_count": len(specs),
-              "authority_file": ".pipeline/core/authority.yml",
-              "judgment_prompt": ".pipeline/core/judgment-prompt.md",
+              "authority_file": ".ztd-platform/pipeline/core/authority.yml",
+              "judgment_prompt": ".ztd-platform/pipeline/core/judgment-prompt.md",
               "spec_comment_patterns": spec_cfg.get("comment_patterns", {}),
               "spec_test_file_patterns": spec_cfg.get("test_file_patterns", {}),
           }
@@ -138,7 +155,9 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const runId = context.payload.workflow_run.id;
+            // workflow_call context: this job is a sibling of the failed jobs
+            // in the consumer's caller run. context.runId points to that run.
+            const runId = context.runId;
 
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
               owner: context.repo.owner,
@@ -187,8 +206,8 @@ jobs:
             ## Context files available
             - fix-context.json: project config, available behavior specs
             - failed-jobs.json: failure logs from CI (tail of each failed job)
-            - .pipeline/core/judgment-prompt.md: the full 5-step template
-            - .pipeline/core/authority.yml: source authority hierarchy
+            - .ztd-platform/pipeline/core/judgment-prompt.md: the full 5-step template
+            - .ztd-platform/pipeline/core/authority.yml: source authority hierarchy
 
             ## Your task
             1. Read failed-jobs.json to understand what failed
@@ -295,7 +314,7 @@ jobs:
         if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
         run: |
           NEXT="${{ steps.guard.outputs.next }}"
-          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          BRANCH="${{ inputs.branch }}"
 
           git config user.name "claude-auto-fix[bot]"
           git config user.email "claude-auto-fix[bot]@users.noreply.github.com"
@@ -312,12 +331,15 @@ jobs:
       - name: Label needs-human if no fix possible
         if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'false'
         uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ inputs.branch }}
         with:
           script: |
+            const branch = process.env.BRANCH;
             const prs = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              head: `${context.repo.owner}:${context.payload.workflow_run.head_branch}`,
+              head: `${context.repo.owner}:${branch}`,
               state: 'open',
             });
             for (const pr of prs.data) {
