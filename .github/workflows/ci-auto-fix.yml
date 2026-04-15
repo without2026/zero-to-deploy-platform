@@ -240,6 +240,36 @@ jobs:
             const reasoning = proposal.reasoning || '(no reasoning provided)';
             const fix = proposal.fix;
 
+            // Build a ready-to-paste Codex cross-validation prompt. The CTO
+            // copies the whole block below into their Claude Code session;
+            // /codex:adversarial-review accepts custom focus text (unlike
+            // /codex:review which is built-in-only).
+            const codexPrompt = [
+              `Cross-validate this auto-fix proposal from Claude for a failing CI PR.`,
+              ``,
+              `Target file: ${fix.file}`,
+              `Spec being violated: ${specId}`,
+              `Confidence Claude assigned: ${confidence}`,
+              ``,
+              `Claude's reasoning:`,
+              reasoning,
+              ``,
+              `Proposed diff:`,
+              '```diff',
+              '- ' + (fix.before || '').split('\n').join('\n- '),
+              '+ ' + (fix.after || '').split('\n').join('\n+ '),
+              '```',
+              ``,
+              `Your task — answer these five questions concretely:`,
+              `1. Open the ACTUAL current file content of ${fix.file}. Does Claude's 'before' string match what is really there? (Claude noted uncertainty because it cannot read the file directly; you can.)`,
+              `2. If 'before' does not match exactly, what is the correct string to replace?`,
+              `3. Is the 'after' value the right destination per spec ${specId}?`,
+              `4. Are there other files that should change together for consistency?`,
+              `5. Verdict: APPROVE as-is / APPROVE with corrected 'before' / REJECT (explain).`,
+              ``,
+              `Be terse. Output five numbered answers, nothing else.`,
+            ].join('\n');
+
             let body;
             if (verdict === 'propose_fix' && fix) {
               body = [
@@ -258,11 +288,18 @@ jobs:
                 '```',
                 '',
                 '---',
-                '**How to cross-validate** (CTO):',
-                '1. Pull this branch locally.',
-                '2. Run `/codex:review` (or eyeball) against the proposed diff above.',
-                '3. If correct: apply the change (search for the `before` block, replace with `after`), commit, push.',
-                '4. If wrong: comment here with the corrected fix or resolve manually.',
+                '#### Cross-validate via Codex (one-command)',
+                '',
+                'Paste this into your Claude Code session (it invokes `/codex:adversarial-review` with a focused prompt built from this proposal):',
+                '',
+                '```',
+                '/codex:adversarial-review ' + JSON.stringify(codexPrompt),
+                '```',
+                '',
+                'Codex will read the actual file content (something Claude could only guess at) and return a five-point verdict. Apply the diff yourself if approved; comment here with corrections if not.',
+                '',
+                '---',
+                '**Alternative manual path**: pull this branch, eyeball the diff, apply by hand, commit, push.',
                 '',
                 `*Full model output attached in the \`auto-fix-report\` artifact.*`,
               ].join('\n');
