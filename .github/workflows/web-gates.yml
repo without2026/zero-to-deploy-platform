@@ -7,6 +7,9 @@ name: Web Deterministic Gates
 on:
   workflow_call:
 
+env:
+  PLATFORM_REF: v0.1.0-alpha
+
 jobs:
   gates:
     runs-on: ubuntu-latest
@@ -14,6 +17,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Checkout platform scripts
+        uses: actions/checkout@v4
+        with:
+          repository: without2026/zero-to-deploy-platform
+          ref: ${{ env.PLATFORM_REF }}
+          path: .ztd-platform
 
       - uses: actions/setup-python@v5
         with:
@@ -37,10 +47,10 @@ jobs:
           echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Spec coverage
-        run: python .pipeline/core/spec-coverage.py
+        run: python .ztd-platform/pipeline/core/spec-coverage.py
 
       - name: Assert guard
-        run: python .pipeline/core/assert-guard.py
+        run: python .ztd-platform/pipeline/core/assert-guard.py
 
       - name: Secret detection
         run: |
@@ -76,7 +86,7 @@ jobs:
           fi
 
       - name: Coverage delta check
-        run: python .github/scripts/coverage-delta.py
+        run: python .ztd-platform/.github/scripts/coverage-delta.py
 
       - name: npm audit (frontend)
         run: |
