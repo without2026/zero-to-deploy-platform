@@ -2,7 +2,34 @@
 
 SemVer. Major bumps require `BREAKING:` in the PR title and an entry in this file.
 
-## v0.1.0-alpha.3 (rolling — latest PR 3c-5, 2026-04-15)
+## v0.1.0-alpha.3 (rolling — latest PR 3c-6, 2026-04-15)
+
+### PR 3c-6 — strip all LLM-in-CI
+CI becomes deterministic only. All LLM-based work (review, auto-fix, scenario-gen, incident-regression spec writing) moves to the CTO's local Claude Code session, where Claude Opus proposes + implements and `/codex:adversarial-review` cross-validates using the CTO's ChatGPT subscription.
+
+Removed workflows and helpers:
+- `.github/workflows/ci-review.yml` (classify / claude-review / codex-review / cross-validate / merge-gate — all gone)
+- `.github/workflows/ci-auto-fix.yml`
+- `.github/workflows/ci-scenario-gen.yml`
+- `pipeline/core/auto_fix_judge.py`
+- `.github/scripts/cross_validator.py`
+- `.github/scripts/review-schema.json`
+- `.github/scripts/validate_generated_changes.py`
+
+Modified:
+- `.github/workflows/deploy-production.yml` — the LLM-driven `incident-regression` job is replaced with a notification job that fires a `repository_dispatch(incident-regression-needed)` event; the CTO's local orchestrator resumes from that signal.
+- Skill template `pr.yml.tmpl` — now calls only `adapter-tests.yml` + `adapter-gates.yml`. Dropped `review` and `auto-fix` jobs; dropped `contents: write` + `id-token: write` + `actions: read` (CI no longer writes back).
+- `.pipeline/orchestrator/required-pr-checks.yml` (v3) — `ai_review` + `merge_gate` categories removed; `skip_counts_as_success` no longer lists `ai_review`; `never_skip_as_success` + `required_presence` trimmed accordingly.
+- `.pipeline/orchestrator/session-schema.json` — `layer1.check_runs` loses `ai_review` + `merge_gate`; `layer1.auto_fix_attempts` renamed to `layer0.local_fix_iterations` (soft cap, not schema-enforced); status enum gains `L0_CODEX_REVIEW` and `L0_FIX_LOCAL`.
+
+SKILL.md updates:
+- State machine: `L0_DONE → L0_CODEX_REVIEW → PR_CREATED`, and `L1_FAILED ⇄ L0_FIX_LOCAL` (orchestrator fixes in-session, no in-CI auto-fix loop).
+- Phase 7 augmented with an explicit `/codex:adversarial-review` step (5-question prompt, verdict categories).
+
+### PR 3c-5 — human-in-loop auto-fix
+(Superseded by 3c-6; ci-auto-fix.yml and auto_fix_judge.py removed entirely.)
+
+
 
 ### PR 3c-5 — human-in-loop auto-fix
 - `pipeline/core/auto_fix_judge.py` rewritten: calls **Claude only**, always produces `fix-proposal.json`, **never applies changes**.
