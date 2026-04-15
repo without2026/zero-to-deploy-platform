@@ -136,31 +136,16 @@ jobs:
               out.write(f'project_root={project_root}\n')
           "
 
-  # ──────────────────────────────────────────────
-  # Layer 1: Deterministic gates (adapter-dispatched)
-  # ──────────────────────────────────────────────
-  deterministic-gates:
-    needs: [classify, load-config]
-    uses: ./.github/workflows/adapter-gates.yml
-    with:
-      adapter: ${{ needs.load-config.outputs.adapter }}
-    secrets: inherit
-
-  # ──────────────────────────────────────────────
-  # Tests (adapter-dispatched)
-  # ──────────────────────────────────────────────
-  tests:
-    needs: [classify, load-config]
-    uses: ./.github/workflows/adapter-tests.yml
-    with:
-      adapter: ${{ needs.load-config.outputs.adapter }}
-    secrets: inherit
+  # Note (v0.1.0-alpha.4): adapter-gates and adapter-tests are NO LONGER
+  # invoked from ci-review. The consumer's caller stub (pr.yml) is expected
+  # to run them as sibling top-level jobs. This removes duplication and
+  # avoids propagating platform_ref through ci-review's internals.
 
   # ──────────────────────────────────────────────
   # Layer 2a: Claude AI review (platform-agnostic)
   # ──────────────────────────────────────────────
   layer2-claude-review:
-    needs: [classify, deterministic-gates]
+    needs: [classify]
     if: needs.classify.outputs.pipeline_depth != 'layer1'
     runs-on: ubuntu-latest
     steps:
@@ -218,7 +203,7 @@ jobs:
   # Layer 2b: Codex AI review (full pipeline only)
   # ──────────────────────────────────────────────
   layer2-codex-review:
-    needs: [classify, deterministic-gates]
+    needs: [classify]
     if: needs.classify.outputs.pipeline_depth == 'full'
     runs-on: ubuntu-latest
     steps:
@@ -385,8 +370,6 @@ jobs:
   merge-gate:
     needs:
       - classify
-      - deterministic-gates
-      - tests
       - layer2-claude-review
       - layer2-codex-review
       - cross-validate
@@ -396,20 +379,16 @@ jobs:
       - name: Check all gates
         env:
           DEPTH: ${{ needs.classify.outputs.pipeline_depth }}
-          GATES: ${{ needs.deterministic-gates.result }}
-          TESTS: ${{ needs.tests.result }}
           CLAUDE: ${{ needs.layer2-claude-review.result }}
           CODEX: ${{ needs.layer2-codex-review.result }}
           CROSS: ${{ needs.cross-validate.result }}
         run: |
           set -euo pipefail
           echo "pipeline_depth=$DEPTH"
-          echo "gates=$GATES tests=$TESTS claude=$CLAUDE codex=$CODEX cross=$CROSS"
+          echo "claude=$CLAUDE codex=$CODEX cross=$CROSS"
+          echo "::notice::gates/tests are consumer-side sibling jobs; not checked here"
 
           fail() { echo "::error::$1"; exit 1; }
-
-          [ "$GATES" = "success" ] || fail "Deterministic gates did not succeed (got $GATES)"
-          [ "$TESTS" = "success" ] || fail "Tests did not succeed (got $TESTS)"
 
           case "$DEPTH" in
             layer1)

@@ -10,21 +10,31 @@ on:
         description: "Adapter name from platform.yml (electron, android, etc.)"
         required: true
         type: string
+      platform_ref:
+        description: "Ref of zero-to-deploy-platform for runtime scripts. Must match the tag/sha used in caller's uses: line."
+        required: true
+        type: string
 
 jobs:
   electron-gates:
     if: inputs.adapter == 'electron'
     uses: ./.github/workflows/electron-gates.yml
+    with:
+      platform_ref: ${{ inputs.platform_ref }}
     secrets: inherit
 
   android-gates:
     if: inputs.adapter == 'android'
     uses: ./.github/workflows/android-gates.yml
+    with:
+      platform_ref: ${{ inputs.platform_ref }}
     secrets: inherit
 
   web-gates:
     if: inputs.adapter == 'web'
     uses: ./.github/workflows/web-gates.yml
+    with:
+      platform_ref: ${{ inputs.platform_ref }}
     secrets: inherit
 
   gate-result:
