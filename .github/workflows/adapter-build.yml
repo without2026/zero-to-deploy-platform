@@ -1,0 +1,37 @@
+name: Adapter Build Dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      adapter:
+        description: "Adapter name from platform.yml (electron, android, etc.)"
+        required: true
+        type: string
+      build_target:
+        description: "Build target: win, mac, linux, or all"
+        required: false
+        default: "all"
+        type: string
+      require_signing:
+        description: "Fail protected targets when signing secrets are missing"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  electron-build:
+    if: inputs.adapter == 'electron'
+    uses: ./.github/workflows/electron-build.yml
+    with:
+      build_target: ${{ inputs.build_target }}
+      require_signing: ${{ inputs.require_signing }}
+    secrets: inherit
+
+  unsupported-adapter:
+    if: inputs.adapter != 'electron'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unsupported adapter
+        run: |
+          echo "::error::No build workflow is configured for adapter=${{ inputs.adapter }}"
+          exit 1

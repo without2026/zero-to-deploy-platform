@@ -1,0 +1,85 @@
+name: Web Deploy
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Deploy target: staging or production"
+        required: true
+        type: string
+      version:
+        description: "Release version tag (e.g., v1.2.3)"
+        required: true
+        type: string
+
+jobs:
+  read-config:
+    runs-on: ubuntu-latest
+    outputs:
+      root: ${{ steps.config.outputs.root }}
+      service: ${{ steps.config.outputs.service }}
+      health_path: ${{ steps.config.outputs.health_path }}
+      staging_secret: ${{ steps.config.outputs.staging_secret }}
+      production_secret: ${{ steps.config.outputs.production_secret }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read deploy config
+        id: config
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          python3 -c "
+          import os, yaml
+          with open('.pipeline/platform.yml') as f:
+              c = yaml.safe_load(f)
+          deploy = c.get('deploy', {})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f\"root={c.get('project_root', '.')}\n\")
+              out.write(f\"service={deploy.get('railway', {}).get('service', 'app')}\n\")
+              out.write(f\"health_path={deploy.get('health', {}).get('path', '/health')}\n\")
+              out.write(f\"staging_secret={deploy.get('endpoints', {}).get('staging_api_url_secret', 'STAGING_API_URL')}\n\")
+              out.write(f\"production_secret={deploy.get('endpoints', {}).get('production_api_url_secret', 'PROD_API_URL')}\n\")
+          "
+
+  deploy-api:
+    needs: read-config
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy API to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "[FAIL] RAILWAY_TOKEN is required for deploy"
+            exit 1
+          fi
+          npm install -g @railway/cli 2>/dev/null || true
+          railway up --environment "${{ inputs.environment }}" --service "${{ needs.read-config.outputs.service }}"
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: [read-config, deploy-api]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: API health check
+        env:
+          API_BASE_URL: ${{ inputs.environment == 'production' && secrets[needs.read-config.outputs.production_secret] || secrets[needs.read-config.outputs.staging_secret] }}
+          HEALTH_PATH: ${{ needs.read-config.outputs.health_path }}
+        run: |
+          ENDPOINT="${API_BASE_URL}${HEALTH_PATH}"
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT" 2>/dev/null || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "[PASS] API healthy after deploy"
+              exit 0
+            fi
+            echo "[WAIT] Attempt $i: status=$STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "[FAIL] API health check failed after 5 attempts"
+          exit 1

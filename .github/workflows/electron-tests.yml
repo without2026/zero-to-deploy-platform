@@ -1,0 +1,86 @@
+# Electron test suite.
+# Reads .pipeline/platform.yml for project_root.
+
+name: Electron Tests
+
+on:
+  workflow_call:
+
+jobs:
+  read-config:
+    runs-on: ubuntu-latest
+    outputs:
+      root: ${{ steps.config.outputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read project_root
+        id: config
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          PROJECT_ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+  backend-tests:
+    needs: read-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        working-directory: ${{ needs.read-config.outputs.root }}/api
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt 2>/dev/null || true
+          pip install pytest pytest-cov pytest-timeout 2>/dev/null || true
+      - name: Backend tests
+        working-directory: ${{ needs.read-config.outputs.root }}/api
+        run: pytest -xvs tests/ --timeout=60
+
+  sidecar-tests:
+    needs: read-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install sidecar deps
+        working-directory: ${{ needs.read-config.outputs.root }}/sidecar
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt 2>/dev/null || true
+          pip install pytest pytest-timeout 2>/dev/null || true
+      - name: Sidecar tests
+        working-directory: ${{ needs.read-config.outputs.root }}/sidecar
+        run: python -m pytest tests/ -xvs --timeout=60
+
+  e2e-smoke:
+    needs: [read-config, backend-tests, sidecar-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
+        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        run: |
+          npm ci 2>/dev/null || true
+          npx playwright install --with-deps chromium 2>/dev/null || true
+      - name: Run e2e smoke tests
+        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        run: |
+          if [ -f playwright.config.ts ] || [ -f playwright.config.js ]; then
+            npx playwright test --reporter=list 2>&1
+          else
+            echo "[INFO] No Playwright config found — skipping e2e"
+          fi

@@ -1,0 +1,572 @@
+# Deploy Production — Manual trigger with staging gate
+#
+# Deploys to production after verifying staging was successful.
+# Includes: Railway API deploy, desktop builds via adapter, smoke test,
+# auto-rollback on failure, and Timing E incident regression loop.
+
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., v1.2.3)"
+        required: true
+        type: string
+      skip_staging_check:
+        description: "Skip staging success verification"
+        required: false
+        default: false
+        type: boolean
+      promote_existing_prerelease:
+        description: "Promote an existing prerelease to stable without rebuilding"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  deployments: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Verify staging passed before production deploy
+  # ──────────────────────────────────────────────
+  staging-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check latest staging deploy
+        if: inputs.skip_staging_check == false
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy-staging.yml',
+              branch: 'main',
+              status: 'completed',
+              per_page: 1,
+            });
+
+            if (runs.data.total_count === 0) {
+              core.setFailed('No staging deploy runs found. Deploy to staging first.');
+              return;
+            }
+
+            const latest = runs.data.workflow_runs[0];
+            if (latest.conclusion !== 'success') {
+              core.setFailed(`Latest staging deploy (${latest.id}) concluded with: ${latest.conclusion}. Fix staging first.`);
+              return;
+            }
+
+            const ageSec = (Date.now() - new Date(latest.updated_at).getTime()) / 1000;
+            if (ageSec > 86400) {
+              core.warning(`Staging deploy is ${Math.round(ageSec / 3600)}h old. Consider re-running staging.`);
+            }
+
+            core.info(`Staging deploy ${latest.id} passed ${Math.round(ageSec / 60)}min ago`);
+
+  # ──────────────────────────────────────────────
+  # Load platform config
+  # ──────────────────────────────────────────────
+  load-config:
+    needs: staging-gate
+    runs-on: ubuntu-latest
+    outputs:
+      project_root: ${{ steps.read.outputs.project_root }}
+      adapter: ${{ steps.read.outputs.adapter }}
+      deploy_backend: ${{ steps.read.outputs.deploy_backend }}
+      deploy_desktop: ${{ steps.read.outputs.deploy_desktop }}
+      release_name: ${{ steps.read.outputs.release_name }}
+      railway_service: ${{ steps.read.outputs.railway_service }}
+      production_api_url_secret: ${{ steps.read.outputs.production_api_url_secret }}
+      health_path: ${{ steps.read.outputs.health_path }}
+      smoke_paths_json: ${{ steps.read.outputs.smoke_paths_json }}
+      max_failed_health_checks: ${{ steps.read.outputs.max_failed_health_checks }}
+      max_p95_latency_ms: ${{ steps.read.outputs.max_p95_latency_ms }}
+      release_prerelease: ${{ steps.read.outputs.release_prerelease }}
+      provenance_checksum_manifest: ${{ steps.read.outputs.provenance_checksum_manifest }}
+      rollout_strategy: ${{ steps.read.outputs.rollout_strategy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read platform.yml
+        id: read
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          python3 -c "
+          import json, yaml, os
+          with open('.pipeline/platform.yml') as f:
+              c = yaml.safe_load(f)
+          deploy = c.get('deploy', {})
+          monitoring = c.get('monitoring', {})
+          health = deploy.get('health', {})
+          deploy_gate = monitoring.get('deploy_gate', {})
+          release_name = c.get('display_name', c.get('platform', 'release'))
+          release = deploy.get('release', {})
+          rollout = deploy.get('rollout', {})
+          prerelease = release.get('prerelease', rollout.get('strategy', 'direct') != 'direct')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f\"project_root={c.get('project_root', '.')}\n\")
+              out.write(f\"adapter={c.get('ci', {}).get('adapter', 'electron')}\n\")
+              out.write(f\"deploy_backend={deploy.get('backend', 'railway')}\n\")
+              out.write(f\"deploy_desktop={deploy.get('desktop', 'github-releases')}\n\")
+              out.write(f\"release_name={release.get('name', release_name)}\n\")
+              out.write(f\"railway_service={deploy.get('railway', {}).get('service', 'app')}\n\")
+              out.write(f\"production_api_url_secret={deploy.get('endpoints', {}).get('production_api_url_secret', 'PROD_API_URL')}\n\")
+              out.write(f\"health_path={health.get('path', '/health')}\n\")
+              out.write(f\"smoke_paths_json={json.dumps(health.get('smoke_paths', ['/health']))}\n\")
+              out.write(f\"max_failed_health_checks={deploy_gate.get('max_failed_health_checks', 3)}\n\")
+              out.write(f\"max_p95_latency_ms={deploy_gate.get('max_p95_latency_ms', 2000)}\n\")
+              out.write(f\"release_prerelease={'true' if prerelease else 'false'}\n\")
+              out.write(f\"provenance_checksum_manifest={'true' if deploy.get('provenance', {}).get('checksum_manifest', True) else 'false'}\n\")
+              out.write(f\"rollout_strategy={rollout.get('strategy', 'direct')}\n\")
+          "
+
+  # ──────────────────────────────────────────────
+  # Deploy API to production
+  # ──────────────────────────────────────────────
+  deploy-api:
+    needs: load-config
+    if: inputs.promote_existing_prerelease == false
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy API via Railway
+        id: deploy
+        if: needs.load-config.outputs.deploy_backend == 'railway'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::error::RAILWAY_TOKEN is required for production deploy"
+            exit 1
+          fi
+          npm install -g @railway/cli 2>/dev/null || true
+          railway up --environment production --service "${{ needs.load-config.outputs.railway_service }}" 2>&1
+          echo "deployed=manual" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # Build + release desktop (Electron only; adapter-build.yml has no android/web packager yet)
+  # ──────────────────────────────────────────────
+  build-desktop:
+    needs: [load-config, deploy-api]
+    if: >-
+      inputs.promote_existing_prerelease == false
+      && needs.load-config.outputs.deploy_desktop == 'github-releases'
+      && needs.load-config.outputs.adapter == 'electron'
+    uses: ./.github/workflows/adapter-build.yml
+    with:
+      adapter: ${{ needs.load-config.outputs.adapter }}
+      build_target: all
+      require_signing: true
+    secrets: inherit
+
+  create-release:
+    needs: [load-config, deploy-api, build-desktop]
+    if: >-
+      inputs.promote_existing_prerelease == false
+      && needs.load-config.outputs.deploy_desktop == 'github-releases'
+      && needs.load-config.outputs.adapter == 'electron'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release-artifacts/desktop
+          merge-multiple: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sidecar-*
+          path: release-artifacts/sidecar
+          merge-multiple: false
+
+      - name: Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: "${{ needs.load-config.outputs.release_name }} ${{ inputs.version }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.load-config.outputs.release_prerelease == 'true' }}
+          files: |
+            release-artifacts/desktop/**/*.exe
+            release-artifacts/desktop/**/*.dmg
+            release-artifacts/desktop/**/*.AppImage
+            release-artifacts/desktop/**/*.deb
+            release-artifacts/sidecar/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate checksum manifest
+        if: needs.load-config.outputs.provenance_checksum_manifest == 'true'
+        run: |
+          python3 <<'PYEOF'
+          import hashlib
+          import pathlib
+
+          root = pathlib.Path("release-artifacts")
+          output = root / "SHA256SUMS.txt"
+          files = [p for p in sorted(root.rglob("*")) if p.is_file() and p.name != "SHA256SUMS.txt"]
+          with output.open("w", encoding="utf-8") as fh:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  fh.write(f"{digest}  {path.relative_to(root)}\n")
+          print(f"[INFO] wrote {output}")
+          PYEOF
+
+      - name: Upload checksum manifest to release
+        if: needs.load-config.outputs.provenance_checksum_manifest == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          files: release-artifacts/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────────
+  # Production smoke test (5 minutes)
+  # ──────────────────────────────────────────────
+  smoke-test:
+    needs: [load-config, deploy-api]
+    if: inputs.promote_existing_prerelease == false
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.smoke.outputs.result }}
+    steps:
+      - name: Wait for deployment propagation
+        run: sleep 30
+
+      - name: Production smoke test
+        id: smoke
+        env:
+          API_BASE_URL: ${{ secrets[needs.load-config.outputs.production_api_url_secret] }}
+          HEALTH_PATH: ${{ needs.load-config.outputs.health_path }}
+          MAX_FAILED: ${{ needs.load-config.outputs.max_failed_health_checks }}
+          MAX_LATENCY_MS: ${{ needs.load-config.outputs.max_p95_latency_ms }}
+          SMOKE_PATHS_JSON: ${{ needs.load-config.outputs.smoke_paths_json }}
+        run: |
+          ENDPOINT="${API_BASE_URL}"
+          HEALTH_URL="${ENDPOINT}${HEALTH_PATH}"
+          TOTAL_CHECKS=10
+          INTERVAL=30
+          FAILURES=0
+
+          echo "[INFO] Running $TOTAL_CHECKS health checks over $((TOTAL_CHECKS * INTERVAL))s"
+
+          for i in $(seq 1 $TOTAL_CHECKS); do
+            RESULT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" "$HEALTH_URL" 2>/dev/null || echo "000 99")
+            STATUS=$(printf '%s' "$RESULT" | awk '{print $1}')
+            LATENCY_MS=$(printf '%s' "$RESULT" | awk '{printf "%.0f", $2 * 1000}')
+            if [ "$STATUS" = "200" ] && [ "$LATENCY_MS" -le "$MAX_LATENCY_MS" ]; then
+              echo "[OK] Check $i/$TOTAL_CHECKS: healthy (${LATENCY_MS}ms)"
+            else
+              echo "[FAIL] Check $i/$TOTAL_CHECKS: status=$STATUS latency=${LATENCY_MS}ms"
+              FAILURES=$((FAILURES + 1))
+            fi
+
+            if [ "$FAILURES" -ge "$MAX_FAILED" ]; then
+              echo "[ABORT] Too many failures ($FAILURES), triggering rollback"
+              echo "result=failed" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            if [ "$i" -lt "$TOTAL_CHECKS" ]; then
+              sleep "$INTERVAL"
+            fi
+          done
+
+          if [ "$FAILURES" -eq 0 ]; then
+            echo "result=passed" >> "$GITHUB_OUTPUT"
+            echo "[PASS] All $TOTAL_CHECKS checks passed"
+          else
+            echo "result=degraded" >> "$GITHUB_OUTPUT"
+            echo "[WARN] $FAILURES/$TOTAL_CHECKS checks failed (degraded)"
+          fi
+
+          echo "[INFO] Endpoint smoke check"
+          mapfile -t ENDPOINTS < <(python3 - <<'PYEOF'
+          import json
+          import os
+          for item in json.loads(os.environ["SMOKE_PATHS_JSON"]):
+              print(item)
+          PYEOF
+          )
+          EXTRA_FAILURES=0
+          for ep in "${ENDPOINTS[@]}"; do
+            RESULT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" "$ENDPOINT$ep" 2>/dev/null || echo "000 99")
+            STATUS=$(printf '%s' "$RESULT" | awk '{print $1}')
+            LATENCY_MS=$(printf '%s' "$RESULT" | awk '{printf "%.0f", $2 * 1000}')
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ] && [ "$LATENCY_MS" -le "$MAX_LATENCY_MS" ]; then
+              echo "[PASS] $ep -> $STATUS (${LATENCY_MS}ms)"
+            else
+              echo "[FAIL] $ep -> $STATUS (${LATENCY_MS}ms)"
+              EXTRA_FAILURES=$((EXTRA_FAILURES + 1))
+            fi
+          done
+          if [ "$FAILURES" -gt 0 ] || [ "$EXTRA_FAILURES" -gt 0 ]; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────
+  # Auto-rollback on smoke failure
+  # ──────────────────────────────────────────────
+  rollback:
+    needs: [load-config, smoke-test]
+    if: inputs.promote_existing_prerelease == false && failure() && needs.load-config.outputs.deploy_backend == 'railway'
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      rolled_back: ${{ steps.rb.outputs.done }}
+    steps:
+      - name: Rollback Railway deployment
+        id: rb
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "[WARN] Cannot rollback without RAILWAY_TOKEN"
+            echo "done=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          npm install -g @railway/cli 2>/dev/null || true
+          railway rollback --environment production --service "${{ needs.load-config.outputs.railway_service }}" --yes 2>&1 && {
+            echo "[DONE] Railway rollback completed"
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          } || {
+            echo "[FAIL] Railway rollback failed"
+            echo "done=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+  # ──────────────────────────────────────────────
+  # Timing E: Incident Regression Loop
+  # On rollback, analyze failure and create fix PR with
+  # incident-regression spec + regression test.
+  # ──────────────────────────────────────────────
+  incident-regression:
+    needs: [load-config, rollback]
+    if: inputs.promote_existing_prerelease == false && always() && needs.rollback.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install -q pyyaml
+
+      - name: Collect incident context
+        run: |
+          python3 << 'PYEOF'
+          import json, pathlib, yaml, subprocess
+
+          config = yaml.safe_load(pathlib.Path(".pipeline/platform.yml").read_text())
+          project_root = config.get("project_root", ".")
+          spec_dir = config.get("spec", {}).get("dir", ".spec")
+
+          recent_commits = subprocess.run(
+              ["git", "log", "--oneline", "-10"],
+              capture_output=True, text=True
+          ).stdout.strip()
+
+          context = {
+              "trigger": "production_smoke_failure",
+              "version": "${{ inputs.version }}",
+              "project_root": project_root,
+              "spec_dir": spec_dir,
+              "recent_commits": recent_commits,
+              "rollback_status": "completed",
+              "authority_file": ".pipeline/core/authority.yml",
+              "spec_template": ".spec/_template.spec.yml",
+          }
+          pathlib.Path("incident-context.json").write_text(json.dumps(context, indent=2))
+          PYEOF
+
+      - name: Timing E — Generate incident regression spec + test
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the Timing E Incident Regression Engine.
+
+            A production deployment just failed and was rolled back.
+
+            ## Context
+            - incident-context.json: deployment details, recent commits
+            - .pipeline/core/authority.yml: source authority hierarchy
+
+            ## Your task
+            1. Analyze the recent commits to identify the likely cause of the production failure
+            2. Create a new `.spec/` entry with `source: incident-regression` (highest authority)
+               - Include `incident_log` field with the deployment failure context
+               - Use the spec template at .spec/_template.spec.yml
+            3. Create a regression test that would catch this failure
+               - Include `# spec: {ID}` comment referencing the new spec entry
+            4. Do NOT modify existing production code (this is just the spec + test)
+
+            ## Output
+            Create incident-report.json:
+            {
+              "spec_id": "...",
+              "spec_file": "...",
+              "test_file": "...",
+              "description": "...",
+              "likely_cause": "..."
+            }
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --max-turns 10
+            --max-budget-usd 1.50
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install verification deps
+        run: |
+          pip install -q pyyaml jsonschema pytest
+
+      - name: Validate incident artifacts
+        run: python .github/scripts/validate_generated_changes.py
+
+      - name: Verify generated regression tests
+        run: |
+          ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          CHANGED="$(git diff --name-only; git ls-files --others --exclude-standard)"
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/api/tests/"; then
+            python -m pip install -q -r "$ROOT/api/requirements.txt" 2>/dev/null || true
+            python -m pip install -q pytest pytest-timeout
+            CHANGED_TESTS=$(printf '%s\n' "$CHANGED" | rg "^${ROOT}/api/tests/.*\\.py$")
+            if [ -n "$CHANGED_TESTS" ]; then
+              (cd "$ROOT/api" && pytest -q --maxfail=1 $(printf '%s\n' "$CHANGED_TESTS" | sed "s#^${ROOT}/api/##"))
+            fi
+          fi
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/sidecar/tests/"; then
+            python -m pip install -q -r "$ROOT/sidecar/requirements.txt" 2>/dev/null || true
+            python -m pip install -q pytest pytest-timeout
+            CHANGED_TESTS=$(printf '%s\n' "$CHANGED" | rg "^${ROOT}/sidecar/tests/.*\\.py$")
+            if [ -n "$CHANGED_TESTS" ]; then
+              (cd "$ROOT/sidecar" && pytest -q --maxfail=1 $(printf '%s\n' "$CHANGED_TESTS" | sed "s#^${ROOT}/sidecar/##"))
+            fi
+          fi
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/desktop/"; then
+            (cd "$ROOT/desktop" && npm ci && npm run build)
+          fi
+
+      - name: Create incident fix branch + PR
+        run: |
+          BRANCH="fix/incident-${{ inputs.version }}-$(date +%s)"
+          git config user.name "claude-incident[bot]"
+          git config user.email "claude-incident[bot]@users.noreply.github.com"
+
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            echo "[INFO] No incident artifacts generated — skipping PR"
+            exit 0
+          fi
+
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "$(cat <<EOF
+          test(incident): regression spec + test for ${{ inputs.version }} rollback
+
+          Timing E: auto-generated after production smoke failure.
+          Source: incident-regression (highest authority, immutable).
+          Requires CTO manual approval to merge.
+          EOF
+          )"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "fix(incident): regression test for ${{ inputs.version }} rollback" \
+            --body "$(cat <<'PREOF'
+          ## Incident Regression (Timing E)
+
+          Production deployment of ${{ inputs.version }} failed smoke tests and was rolled back.
+
+          This PR adds:
+          - New `.spec/` entry with `source: incident-regression` (immutable, highest authority)
+          - Regression test to prevent this failure from recurring
+
+          **This PR requires CTO manual approval. Auto-merge is disabled for Timing E fixes.**
+          PREOF
+          )" \
+            --label "needs-human,incident-regression"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload incident report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-report
+          path: |
+            incident-report.json
+            incident-context.json
+          if-no-files-found: ignore
+
+  promote-release:
+    needs: [load-config]
+    if: inputs.promote_existing_prerelease == true && needs.load-config.outputs.rollout_strategy != 'direct'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Promote prerelease to stable
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag,
+            });
+
+            if (!release.data.prerelease) {
+              core.info(`Release ${tag} is already stable`);
+              return;
+            }
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.data.id,
+              tag_name: tag,
+              name: release.data.name,
+              draft: false,
+              prerelease: false,
+              make_latest: "true",
+            });
+            core.info(`Promoted prerelease ${tag} to stable`);

@@ -1,0 +1,72 @@
+name: Web Build
+on:
+  workflow_call:
+    inputs:
+      build_target:
+        description: "Build target: frontend, backend, or all"
+        required: false
+        default: "all"
+        type: string
+
+jobs:
+  read-config:
+    runs-on: ubuntu-latest
+    outputs:
+      root: ${{ steps.config.outputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read project_root
+        id: config
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          PROJECT_ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+  build-frontend:
+    needs: read-config
+    runs-on: ubuntu-latest
+    if: inputs.build_target == 'all' || inputs.build_target == 'frontend'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install and build
+        working-directory: ${{ needs.read-config.outputs.root }}/web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-frontend
+          path: ${{ needs.read-config.outputs.root }}/web/dist/
+
+  build-backend:
+    needs: read-config
+    runs-on: ubuntu-latest
+    if: inputs.build_target == 'all' || inputs.build_target == 'backend'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify backend
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/api/requirements.txt" ]; then
+            cd "$ROOT/api"
+            pip install -r requirements.txt
+            python -c "from app.main import app; print('[PASS] Backend imports OK')"
+          fi

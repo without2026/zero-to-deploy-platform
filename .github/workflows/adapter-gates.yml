@@ -1,0 +1,48 @@
+# Adapter dispatcher: routes deterministic gates to the correct platform adapter.
+# Called by ci-review.yml with the adapter name from platform.yml.
+
+name: Adapter Gates Dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      adapter:
+        description: "Adapter name from platform.yml (electron, android, etc.)"
+        required: true
+        type: string
+
+jobs:
+  electron-gates:
+    if: inputs.adapter == 'electron'
+    uses: ./.github/workflows/electron-gates.yml
+    secrets: inherit
+
+  android-gates:
+    if: inputs.adapter == 'android'
+    uses: ./.github/workflows/android-gates.yml
+    secrets: inherit
+
+  web-gates:
+    if: inputs.adapter == 'web'
+    uses: ./.github/workflows/web-gates.yml
+    secrets: inherit
+
+  gate-result:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [electron-gates, android-gates, web-gates]
+    steps:
+      - name: Verify at least one adapter ran
+        run: |
+          E="${{ needs.electron-gates.result }}"
+          A="${{ needs.android-gates.result }}"
+          W="${{ needs.web-gates.result }}"
+          if [ "$E" = "success" ] || [ "$A" = "success" ] || [ "$W" = "success" ]; then
+            echo "[PASS] Adapter gates completed"
+          elif [ "$E" = "skipped" ] && [ "$A" = "skipped" ] && [ "$W" = "skipped" ]; then
+            echo "::error::No adapter matched: ${{ inputs.adapter }}"
+            exit 1
+          else
+            echo "::error::Adapter gate failed (electron=$E, android=$A, web=$W)"
+            exit 1
+          fi

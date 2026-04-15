@@ -1,0 +1,67 @@
+# Source Authority Hierarchy
+# Used by the 5-step judgment framework to adjust confidence
+# when determining whether to fix code or fix test.
+#
+# Higher authority = less likely the spec is wrong.
+# confidence_modifier is applied to the base confidence in Step 2.
+
+hierarchy:
+  - source: incident-regression
+    authority: highest
+    confidence_modifier: +0.2
+    description: "실제 production 사고에서 발견. 삭제/약화 절대 불가."
+    timing: E
+    policy_gate: immutable
+
+  - source: phase2-acceptance
+    authority: high
+    confidence_modifier: +0.0
+    description: "CTO가 승인한 acceptance criteria."
+    timing: A
+    policy_gate: cto_approval_to_change
+
+  - source: api-schema-validation
+    authority: high
+    confidence_modifier: -0.05
+    description: "OpenAPI/JSON Schema에서 기계적으로 파생."
+    timing: A/B
+    policy_gate: none
+
+  - source: domain-invariant
+    authority: high
+    confidence_modifier: -0.05
+    description: "도메인 불변 — 물리적 제약, 보안 규칙."
+    timing: A/B
+    policy_gate: none
+
+  - source: review-discovery
+    authority: medium
+    confidence_modifier: -0.10
+    description: "AI/인간 리뷰어가 코드 리뷰 중 발견한 누락 케이스."
+    timing: D
+    policy_gate: none
+
+  - source: edge-case-review
+    authority: medium
+    confidence_modifier: -0.10
+    description: "Phase 7 또는 pre-PR 단계에서 발견된 edge case."
+    timing: C
+    policy_gate: none
+
+  - source: regression-guard
+    authority: lowest
+    confidence_modifier: -0.15
+    description: "기존 동작 보존 목적. 변경 허용 가능."
+    timing: B_legacy
+    policy_gate: none
+
+# When no spec is found:
+no_spec_penalty: -0.30
+
+# Spec type flakiness adjustments (applied in addition to source authority)
+type_adjustments:
+  lifecycle: -0.10
+  gesture: -0.10
+  permission: -0.05
+  ui_interaction: 0.0
+  api: 0.0

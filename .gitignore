@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local test output
+/test-output/
+/coverage/
+*.log
+
+# Secrets (defensive; org-level secrets belong in GitHub, never on disk)
+*.env
+*.env.local
+.secrets

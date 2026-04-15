@@ -1,0 +1,347 @@
+# Auto-Fix Loop — 5-Step Judgment Engine
+#
+# Triggered when ci-review.yml fails. Uses the spec oracle + 5-step judgment
+# to determine whether to fix code or fix test, then commits the minimal fix.
+#
+# Loop prevention (3-layer):
+#   1. Branch prefix guard: skip branches starting with 'claude-fix-'
+#   2. Iteration counter: commit message [fix N/5], N >= 5 -> stop + label
+#   3. Budget cap: --max-budget-usd 2.00 per run
+
+name: CI Auto-Fix Loop
+
+on:
+  workflow_run:
+    workflows: ["CI Review Pipeline"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  MAX_ITERATIONS: 5
+  MAX_BUDGET_USD: "2.00"
+
+jobs:
+  auto-fix:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && !startsWith(github.event.workflow_run.head_branch, 'claude-fix-')
+      && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: pip install -q pyyaml
+
+      - name: Guard — check iteration count
+        id: guard
+        run: |
+          LAST_MSG=$(git log -1 --format='%s')
+          ITER=0
+          if [[ "$LAST_MSG" =~ \[fix\ ([0-9]+)/ ]]; then
+            ITER="${BASH_REMATCH[1]}"
+          fi
+          echo "iteration=$ITER" >> "$GITHUB_OUTPUT"
+
+          if [ "$ITER" -ge "$MAX_ITERATIONS" ]; then
+            echo "max_reached=true" >> "$GITHUB_OUTPUT"
+            echo "[STOP] Max iterations ($MAX_ITERATIONS) reached"
+          else
+            echo "max_reached=false" >> "$GITHUB_OUTPUT"
+            NEXT=$((ITER + 1))
+            echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Label needs-human if max iterations
+        if: steps.guard.outputs.max_reached == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${context.payload.workflow_run.head_branch}`,
+              state: 'open',
+            });
+            for (const pr of prs.data) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['needs-human'],
+              });
+            }
+
+      - name: Collect failure context
+        if: steps.guard.outputs.max_reached == 'false'
+        id: collect
+        run: |
+          python3 << 'PYEOF'
+          import json, pathlib, re, yaml, os
+
+          config_path = pathlib.Path(".pipeline/platform.yml")
+          config = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+          project_root = config.get("project_root", ".")
+
+          spec_dir = pathlib.Path(config.get("spec", {}).get("dir", ".spec"))
+          specs = {}
+          if spec_dir.exists():
+              for sf in spec_dir.glob("*.spec.yml"):
+                  data = yaml.safe_load(sf.read_text())
+                  for b in data.get("behaviors", []):
+                      bid = b.get("id")
+                      if bid:
+                          specs[bid] = {**b, "_file": str(sf)}
+
+          spec_cfg = config.get("spec", {})
+          context = {
+              "project_root": project_root,
+              "platform": config.get("platform", "unknown"),
+              "ci_adapter": config.get("ci", {}).get("adapter", "electron"),
+              "specs": specs,
+              "spec_count": len(specs),
+              "authority_file": ".pipeline/core/authority.yml",
+              "judgment_prompt": ".pipeline/core/judgment-prompt.md",
+              "spec_comment_patterns": spec_cfg.get("comment_patterns", {}),
+              "spec_test_file_patterns": spec_cfg.get("test_file_patterns", {}),
+          }
+
+          pathlib.Path("fix-context.json").write_text(json.dumps(context, indent=2, default=str))
+          print(f"[INFO] Collected context: {len(specs)} specs, platform={context['platform']}")
+
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"has_specs={'true' if specs else 'false'}\n")
+          PYEOF
+
+      - name: Download failed workflow logs
+        if: steps.guard.outputs.max_reached == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const runId = context.payload.workflow_run.id;
+
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+              filter: 'latest',
+            });
+
+            const failedJobs = jobs.data.jobs.filter(j => j.conclusion === 'failure');
+            const summaries = [];
+
+            for (const job of failedJobs.slice(0, 3)) {
+              try {
+                const logs = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  job_id: job.id,
+                });
+                const logText = typeof logs.data === 'string' ? logs.data : '';
+                const tail = logText.split('\n').slice(-100).join('\n');
+                summaries.push({
+                  job_name: job.name,
+                  conclusion: job.conclusion,
+                  log_tail: tail.substring(0, 4000),
+                });
+              } catch (e) {
+                summaries.push({
+                  job_name: job.name,
+                  conclusion: job.conclusion,
+                  log_tail: `(failed to fetch logs: ${e.message})`,
+                });
+              }
+            }
+
+            fs.writeFileSync('failed-jobs.json', JSON.stringify(summaries, null, 2));
+            core.info(`Collected logs from ${summaries.length} failed job(s)`);
+
+      - name: 5-Step Judgment + Fix via Claude
+        if: steps.guard.outputs.max_reached == 'false'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the 5-Step Judgment Engine for CI auto-fix.
+
+            ## Context files available
+            - fix-context.json: project config, available behavior specs
+            - failed-jobs.json: failure logs from CI (tail of each failed job)
+            - .pipeline/core/judgment-prompt.md: the full 5-step template
+            - .pipeline/core/authority.yml: source authority hierarchy
+
+            ## Your task
+            1. Read failed-jobs.json to understand what failed
+            2. Read fix-context.json for project context and available specs
+            3. For each failure, follow the 5-step judgment in judgment-prompt.md:
+               - Step 1: Convert the failing assertion to natural language
+               - Step 2: Look up spec ID (search test files for "# spec:" or "// spec:" comments)
+               - Step 3: Three-way comparison (spec vs assertion vs code)
+               - Step 4: Generate the minimal fix
+               - Step 5: Choose verdict (fix_code / fix_test / escalate)
+            4. Apply the fix directly to the files
+            5. Do NOT fix unrelated code. Surgical changes only.
+
+            ## Confidence thresholds
+            - fix_code: confidence >= 0.7 -> apply
+            - fix_test: confidence >= 0.8 -> apply
+            - Below threshold -> do NOT apply, just report
+
+            ## Output
+            After applying fixes, create a file called fix-report.json with:
+            {
+              "fixes": [{ "file": "...", "verdict": "...", "confidence": 0.X, "spec_id": "...", "description": "..." }],
+              "escalations": [{ "file": "...", "reason": "..." }]
+            }
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --max-turns 15
+            --max-budget-usd ${{ env.MAX_BUDGET_USD }}
+
+      - name: Check if fixes were applied
+        if: steps.guard.outputs.max_reached == 'false'
+        id: check
+        run: |
+          UNTRACKED="$(git ls-files --others --exclude-standard)"
+          if git diff --quiet && [ -z "$UNTRACKED" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "[INFO] No changes applied"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "[INFO] Changes detected:"
+            git diff --stat
+            if [ -n "$UNTRACKED" ]; then
+              echo "[INFO] Untracked files:"
+              printf '%s\n' "$UNTRACKED"
+            fi
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
+        with:
+          node-version: "20"
+
+      - name: Install verification deps
+        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
+        run: |
+          pip install -q pyyaml jsonschema pytest
+
+      - name: Validate generated changes
+        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
+        run: python .github/scripts/validate_generated_changes.py
+
+      - name: Run focused verification
+        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
+        run: |
+          ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          CHANGED="$(git diff --name-only; git ls-files --others --exclude-standard)"
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/api/"; then
+            echo "[INFO] Verifying api changes"
+            python -m pip install -q -r "$ROOT/api/requirements.txt" 2>/dev/null || true
+            python -m pip install -q pytest pytest-timeout
+            (cd "$ROOT/api" && pytest -q tests/ --maxfail=1)
+          fi
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/sidecar/"; then
+            echo "[INFO] Verifying sidecar changes"
+            python -m pip install -q -r "$ROOT/sidecar/requirements.txt" 2>/dev/null || true
+            python -m pip install -q pytest pytest-timeout
+            if [ -d "$ROOT/sidecar/tests" ]; then
+              (cd "$ROOT/sidecar" && pytest -q tests/ --maxfail=1)
+            fi
+          fi
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/desktop/"; then
+            echo "[INFO] Verifying desktop changes"
+            (cd "$ROOT/desktop" && npm ci && npm run build)
+          fi
+
+          if printf '%s\n' "$CHANGED" | rg -q "^${ROOT}/android/.*\\.kt$"; then
+            echo "[INFO] Verifying Android (Kotlin) changes"
+            if [ -d "$ROOT/android" ] && [ -f "$ROOT/android/gradlew" ]; then
+              chmod +x "$ROOT/android/gradlew"
+              (cd "$ROOT/android" && ./gradlew testDebugUnitTest --no-daemon --console=plain)
+            else
+              echo "[WARN] android/ or gradlew missing — skip Gradle verify"
+            fi
+          fi
+
+      - name: Commit and push fixes
+        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'true'
+        run: |
+          NEXT="${{ steps.guard.outputs.next }}"
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+
+          git config user.name "claude-auto-fix[bot]"
+          git config user.email "claude-auto-fix[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "$(cat <<EOF
+          fix(auto): [fix ${NEXT}/${MAX_ITERATIONS}] CI auto-fix via 5-step judgment
+
+          Applied by ci-auto-fix.yml iteration ${NEXT}.
+          See fix-report.json artifact for details.
+          EOF
+          )"
+          git push origin "HEAD:$BRANCH"
+
+      - name: Label needs-human if no fix possible
+        if: steps.guard.outputs.max_reached == 'false' && steps.check.outputs.has_changes == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${context.payload.workflow_run.head_branch}`,
+              state: 'open',
+            });
+            for (const pr of prs.data) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['needs-human'],
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: '**Auto-fix engine** could not resolve the CI failure automatically.\n\nPlease review the failure logs and fix manually.',
+              });
+            }
+
+      - name: Upload fix report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-fix-report
+          path: |
+            fix-report.json
+            fix-context.json
+            failed-jobs.json
+          if-no-files-found: ignore

@@ -1,0 +1,135 @@
+name: Electron Build
+on:
+  workflow_call:
+    inputs:
+      build_target:
+        description: "Build target: win, mac, linux, or all"
+        required: false
+        default: "all"
+        type: string
+      require_signing:
+        description: "Fail protected targets when signing secrets are missing"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  read-config:
+    runs-on: ubuntu-latest
+    outputs:
+      root: ${{ steps.config.outputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read project_root
+        id: config
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          PROJECT_ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+  build-desktop:
+    needs: read-config
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+          - os: windows-latest
+            target: win
+          - os: macos-14
+            target: mac
+    runs-on: ${{ matrix.os }}
+    if: inputs.build_target == 'all' || inputs.build_target == matrix.target
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        run: npm ci
+
+      - name: Build renderer
+        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        run: npm run build
+
+      - name: Verify signing prerequisites
+        if: inputs.require_signing
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ "${{ matrix.target }}" = "win" ] && { [ -z "$CSC_LINK" ] || [ -z "$CSC_KEY_PASSWORD" ]; }; then
+            echo "::error::Windows signing is required but CSC_LINK/CSC_KEY_PASSWORD is missing"
+            exit 1
+          fi
+          if [ "${{ matrix.target }}" = "mac" ] && { [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; }; then
+            echo "::error::macOS signing/notarization is required but Apple signing secrets are missing"
+            exit 1
+          fi
+
+      - name: Package installer
+        working-directory: ${{ needs.read-config.outputs.root }}/desktop
+        run: npx electron-builder --${{ matrix.target }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: |
+            ${{ needs.read-config.outputs.root }}/desktop/dist/*.exe
+            ${{ needs.read-config.outputs.root }}/desktop/dist/*.dmg
+            ${{ needs.read-config.outputs.root }}/desktop/dist/*.AppImage
+            ${{ needs.read-config.outputs.root }}/desktop/dist/*.deb
+
+  build-sidecar:
+    needs: read-config
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+          - os: windows-latest
+            target: win
+          - os: macos-14
+            target: mac
+    if: inputs.build_target == 'all' || inputs.build_target == matrix.target
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps & build sidecar
+        working-directory: ${{ needs.read-config.outputs.root }}
+        run: |
+          pip install pyinstaller
+          pip install -r sidecar/requirements.txt 2>/dev/null || true
+          pyinstaller --onefile --name becalm-sidecar sidecar/main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-${{ matrix.target }}
+          path: ${{ needs.read-config.outputs.root }}/dist/becalm-sidecar*

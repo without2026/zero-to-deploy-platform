@@ -1,0 +1,48 @@
+# Adapter dispatcher: routes tests to the correct platform adapter.
+# Called by ci-review.yml with the adapter name from platform.yml.
+
+name: Adapter Tests Dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      adapter:
+        description: "Adapter name from platform.yml (electron, android, etc.)"
+        required: true
+        type: string
+
+jobs:
+  electron-tests:
+    if: inputs.adapter == 'electron'
+    uses: ./.github/workflows/electron-tests.yml
+    secrets: inherit
+
+  android-tests:
+    if: inputs.adapter == 'android'
+    uses: ./.github/workflows/android-tests.yml
+    secrets: inherit
+
+  web-tests:
+    if: inputs.adapter == 'web'
+    uses: ./.github/workflows/web-tests.yml
+    secrets: inherit
+
+  test-result:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [electron-tests, android-tests, web-tests]
+    steps:
+      - name: Verify at least one adapter ran
+        run: |
+          E="${{ needs.electron-tests.result }}"
+          A="${{ needs.android-tests.result }}"
+          W="${{ needs.web-tests.result }}"
+          if [ "$E" = "success" ] || [ "$A" = "success" ] || [ "$W" = "success" ]; then
+            echo "[PASS] Adapter tests completed"
+          elif [ "$E" = "skipped" ] && [ "$A" = "skipped" ] && [ "$W" = "skipped" ]; then
+            echo "::error::No adapter matched: ${{ inputs.adapter }}"
+            exit 1
+          else
+            echo "::error::Adapter test failed (electron=$E, android=$A, web=$W)"
+            exit 1
+          fi

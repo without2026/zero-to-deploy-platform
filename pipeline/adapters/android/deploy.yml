@@ -1,0 +1,65 @@
+name: Android Deploy
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Deploy target: staging or production"
+        required: true
+        type: string
+      track:
+        description: "Play Console track: internal, alpha, beta, production"
+        required: false
+        default: "internal"
+        type: string
+
+jobs:
+  deploy-api:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy API to Railway
+        if: inputs.environment == 'production'
+        run: |
+          echo "[INFO] Railway auto-deploys from main branch."
+          echo "[INFO] Manual: railway up --service becalm-api"
+
+  deploy-android:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    needs: deploy-api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-aab
+          path: release-artifacts/
+
+      - name: Upload to Play Console
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.becalm.app
+          releaseFiles: release-artifacts/**/*.aab
+          track: ${{ inputs.track }}
+          status: completed
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: deploy-api
+    steps:
+      - name: API health check
+        run: |
+          ENDPOINT="${{ inputs.environment == 'production' && secrets.PROD_API_URL || secrets.STAGING_API_URL }}"
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/health" 2>/dev/null || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "[PASS] API healthy"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "[FAIL] API health check failed"
+          exit 1

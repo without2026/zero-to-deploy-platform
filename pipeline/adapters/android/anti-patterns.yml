@@ -1,0 +1,13 @@
+test_anti_patterns:
+  - pattern: "@Ignore"
+    description: "Unconditional test skip (JUnit / Kotlin JVM)"
+  - pattern: "assertTrue(true)"
+    description: "Vacuous assertion (JUnit / Kotlin)"
+  - pattern: "// assert"
+    description: "Commented-out assertion (Kotlin/Java)"
+  - pattern: "@Disabled"
+    description: "Unconditional test skip (JUnit 5)"
+  - pattern: "Assume.assumeTrue(false)"
+    description: "Assumption-based test skip"
+  - pattern: "@kotlin.test.Ignore"
+    description: "kotlin.test unconditional skip"

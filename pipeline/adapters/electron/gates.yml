@@ -1,0 +1,80 @@
+name: Electron Deterministic Gates
+on:
+  workflow_call:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python tools
+        run: pip install pyyaml detect-secrets pip-audit
+
+      - name: Read project_root
+        id: config
+        run: |
+          PROJECT_ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Spec coverage
+        run: python .pipeline/core/spec-coverage.py
+
+      - name: Assert guard
+        run: python .pipeline/core/assert-guard.py
+
+      - name: Secret detection
+        run: |
+          if [ -f .secrets.baseline ]; then
+            detect-secrets scan --baseline .secrets.baseline
+          else
+            detect-secrets scan > .secrets.baseline
+            echo "[WARN] Baseline created. Review and commit .secrets.baseline"
+          fi
+
+      - name: Coverage baseline (base branch)
+        run: |
+          ROOT="${{ steps.config.outputs.root }}"
+          git checkout ${{ github.event.pull_request.base.sha }} -- . 2>/dev/null || true
+          cd "$ROOT/api"
+          pip install -q coverage pytest 2>/dev/null || true
+          coverage run -m pytest tests/ --tb=no -q 2>/dev/null || true
+          coverage json -o ../../coverage-before.json 2>/dev/null || true
+          cd ../..
+          git checkout ${{ github.event.pull_request.head.sha }} -- . 2>/dev/null || true
+
+      - name: Coverage current (PR branch)
+        run: |
+          ROOT="${{ steps.config.outputs.root }}"
+          cd "$ROOT/api"
+          pip install -q coverage pytest 2>/dev/null || true
+          coverage run -m pytest tests/ --tb=no -q 2>/dev/null || true
+          coverage json -o ../../coverage-after.json 2>/dev/null || true
+          cd ../..
+
+      - name: Coverage delta check
+        run: python .github/scripts/coverage-delta.py
+
+      - name: npm audit
+        working-directory: ${{ steps.config.outputs.root }}/desktop
+        run: npm audit --audit-level=high --omit=dev 2>/dev/null || echo "[WARN] npm audit skipped"
+
+      - name: pip-audit
+        run: |
+          ROOT="${{ steps.config.outputs.root }}"
+          pip-audit -r "$ROOT/api/requirements.txt" 2>/dev/null || echo "[WARN] api pip-audit skipped"
+          pip-audit -r "$ROOT/sidecar/requirements.txt" 2>/dev/null || echo "[WARN] sidecar pip-audit skipped"

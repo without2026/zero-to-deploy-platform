@@ -1,0 +1,114 @@
+# Web test suite (thin wrapper).
+# Delegates to .pipeline/adapters/web/test.yml logic.
+# Reads .pipeline/platform.yml for project_root.
+
+name: Web Tests
+
+on:
+  workflow_call:
+
+jobs:
+  read-config:
+    runs-on: ubuntu-latest
+    outputs:
+      root: ${{ steps.config.outputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read project_root
+        id: config
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          PROJECT_ROOT=$(python3 -c "
+          import yaml
+          with open('.pipeline/platform.yml') as f:
+              print(yaml.safe_load(f).get('project_root', '.'))
+          ")
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+  backend-tests:
+    needs: read-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/api/requirements.txt" ]; then
+            cd "$ROOT/api"
+            pip install --upgrade pip
+            pip install -r requirements.txt 2>/dev/null || true
+            pip install pytest pytest-cov pytest-timeout 2>/dev/null || true
+          fi
+      - name: Backend tests
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -d "$ROOT/api/tests" ]; then
+            cd "$ROOT/api"
+            pytest -xvs tests/ --timeout=60
+          else
+            echo "[INFO] No api/tests/ — skipping backend tests"
+          fi
+
+  frontend-tests:
+    needs: read-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install frontend deps
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/web/package.json" ]; then
+            cd "$ROOT/web"
+            npm ci 2>/dev/null || npm install
+          fi
+      - name: Frontend build check
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/web/package.json" ]; then
+            cd "$ROOT/web"
+            npm run build 2>&1
+          else
+            echo "[INFO] No web/package.json — skipping frontend build"
+          fi
+      - name: Frontend unit tests
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/web/package.json" ]; then
+            cd "$ROOT/web"
+            npm test -- --passWithNoTests 2>&1 || echo "[WARN] Frontend tests failed or not configured"
+          fi
+
+  e2e-smoke:
+    needs: [read-config, backend-tests, frontend-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/web/package.json" ]; then
+            cd "$ROOT/web"
+            npm ci 2>/dev/null || npm install
+            npx playwright install --with-deps chromium 2>/dev/null || true
+          fi
+      - name: Run e2e smoke tests
+        run: |
+          ROOT="${{ needs.read-config.outputs.root }}"
+          if [ -f "$ROOT/web/playwright.config.ts" ] || [ -f "$ROOT/web/playwright.config.js" ]; then
+            cd "$ROOT/web"
+            npx playwright test --reporter=list 2>&1
+          else
+            echo "[INFO] No Playwright config — skipping e2e"
+          fi

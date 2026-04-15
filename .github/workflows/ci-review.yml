@@ -1,0 +1,421 @@
+# CI/CD Review Pipeline — Platform Adapter Architecture
+#
+# Reads .pipeline/platform.yml to determine which adapter to use.
+# Core logic (classify, AI review, merge gate) is platform-agnostic.
+# Deterministic gates and tests are delegated to the adapter.
+#
+# PR size routing:
+#   docs-only / <10 LOC  -> Layer 1 only (skip AI review)
+#   10-50 LOC            -> Claude review only (skip Codex)
+#   50+ LOC or sensitive -> Full pipeline (Claude + Codex + cross-validate)
+
+name: CI Review Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Classify PR size and determine pipeline depth
+  # (Platform-agnostic)
+  # ──────────────────────────────────────────────
+  classify:
+    runs-on: ubuntu-latest
+    outputs:
+      loc_changed: ${{ steps.stats.outputs.loc }}
+      files_changed: ${{ steps.stats.outputs.files }}
+      is_docs_only: ${{ steps.stats.outputs.docs_only }}
+      has_sensitive: ${{ steps.stats.outputs.sensitive }}
+      pipeline_depth: ${{ steps.route.outputs.depth }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute PR stats
+        id: stats
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          DIFF_STAT=$(git diff --shortstat "$BASE" "$HEAD" 2>/dev/null || echo "0 files changed")
+          LOC=$(echo "$DIFF_STAT" | grep -oP '\d+(?= insertion)' || echo 0)
+          DEL=$(echo "$DIFF_STAT" | grep -oP '\d+(?= deletion)' || echo 0)
+          TOTAL_LOC=$(( ${LOC:-0} + ${DEL:-0} ))
+          FILES=$(git diff --name-only "$BASE" "$HEAD" | wc -l)
+
+          DOCS_ONLY="true"
+          SENSITIVE="false"
+          while IFS= read -r f; do
+            case "$f" in
+              *.md|*.txt|*.rst|docs/*) ;;
+              *) DOCS_ONLY="false" ;;
+            esac
+            case "$f" in
+              *auth*|*billing*|*migration*|*secret*|*.env*|*admin*)
+                SENSITIVE="true" ;;
+            esac
+          done < <(git diff --name-only "$BASE" "$HEAD")
+
+          echo "loc=$TOTAL_LOC" >> "$GITHUB_OUTPUT"
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "docs_only=$DOCS_ONLY" >> "$GITHUB_OUTPUT"
+          echo "sensitive=$SENSITIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Route pipeline
+        id: route
+        run: |
+          LOC=${{ steps.stats.outputs.loc }}
+          DOCS=${{ steps.stats.outputs.docs_only }}
+          SENS=${{ steps.stats.outputs.sensitive }}
+
+          if [ "$DOCS" = "true" ] || [ "$LOC" -lt 10 ]; then
+            echo "depth=layer1" >> "$GITHUB_OUTPUT"
+          elif [ "$LOC" -lt 50 ] && [ "$SENS" = "false" ]; then
+            echo "depth=claude_only" >> "$GITHUB_OUTPUT"
+          else
+            echo "depth=full" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ──────────────────────────────────────────────
+  # Load platform config from .pipeline/platform.yml
+  # ──────────────────────────────────────────────
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      adapter: ${{ steps.read.outputs.adapter }}
+      primary_runner: ${{ steps.read.outputs.primary_runner }}
+      platform: ${{ steps.read.outputs.platform }}
+      project_root: ${{ steps.read.outputs.project_root }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read platform.yml
+        id: read
+        run: |
+          PLATFORM_FILE=".pipeline/platform.yml"
+          if [ ! -f "$PLATFORM_FILE" ]; then
+            echo "[WARN] No platform.yml found, defaulting to electron"
+            echo "adapter=electron" >> "$GITHUB_OUTPUT"
+            echo "primary_runner=ubuntu-latest" >> "$GITHUB_OUTPUT"
+            echo "platform=electron-desktop" >> "$GITHUB_OUTPUT"
+            echo "project_root=." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pip install -q pyyaml 2>/dev/null || true
+          python3 -c "
+          import yaml, os
+          with open('$PLATFORM_FILE') as f:
+              c = yaml.safe_load(f)
+          ci = c.get('ci', {})
+          adapter = ci.get('adapter', 'electron')
+          runner = ci.get('runners', {}).get('primary', 'ubuntu-latest')
+          platform = c.get('platform', 'electron-desktop')
+          project_root = c.get('project_root', '.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'adapter={adapter}\n')
+              out.write(f'primary_runner={runner}\n')
+              out.write(f'platform={platform}\n')
+              out.write(f'project_root={project_root}\n')
+          "
+
+  # ──────────────────────────────────────────────
+  # Layer 1: Deterministic gates (adapter-dispatched)
+  # ──────────────────────────────────────────────
+  deterministic-gates:
+    needs: [classify, load-config]
+    uses: ./.github/workflows/adapter-gates.yml
+    with:
+      adapter: ${{ needs.load-config.outputs.adapter }}
+    secrets: inherit
+
+  # ──────────────────────────────────────────────
+  # Tests (adapter-dispatched)
+  # ──────────────────────────────────────────────
+  tests:
+    needs: [classify, load-config]
+    uses: ./.github/workflows/adapter-tests.yml
+    with:
+      adapter: ${{ needs.load-config.outputs.adapter }}
+    secrets: inherit
+
+  # ──────────────────────────────────────────────
+  # Layer 2a: Claude AI review (platform-agnostic)
+  # ──────────────────────────────────────────────
+  layer2-claude-review:
+    needs: [classify, deterministic-gates]
+    if: needs.classify.outputs.pipeline_depth != 'layer1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude structured review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review the PR diff for this pull request.
+            Follow the instructions in .github/prompts/review-prompt.md.
+            Output ONLY valid JSON matching the schema in .github/scripts/review-schema.json.
+            Do not include markdown fences or explanation outside the JSON.
+          claude_args: >-
+            --output-format json
+            --json-schema "$(cat .github/scripts/review-schema.json)"
+            --model claude-sonnet-4-6
+            --max-turns 5
+
+      - name: Extract structured output
+        run: |
+          if [ -f claude-output.json ]; then
+            jq '.structured_output // .result' claude-output.json > claude-review.json
+          else
+            echo '{"issues":[],"verdict":"pass","summary":"No output"}' > claude-review.json
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-review
+          path: claude-review.json
+
+      - name: Label missing-tests if needed
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('claude-review.json')) return;
+            const data = JSON.parse(fs.readFileSync('claude-review.json', 'utf8'));
+            const missing = data.missing_tests || [];
+            if (missing.length === 0) return;
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['missing-tests'],
+            });
+            core.info(`Added missing-tests label (${missing.length} missing test(s))`);
+
+  # ──────────────────────────────────────────────
+  # Layer 2b: Codex AI review (full pipeline only)
+  # ──────────────────────────────────────────────
+  layer2-codex-review:
+    needs: [classify, deterministic-gates]
+    if: needs.classify.outputs.pipeline_depth == 'full'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Codex structured review
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/prompts/review-prompt.md
+          sandbox: read-only
+          output-file: codex-review-raw.json
+          output-schema-file: .github/scripts/review-schema.json
+
+      - name: Normalize output
+        run: |
+          if [ -f codex-review-raw.json ]; then
+            cp codex-review-raw.json codex-review.json
+          else
+            echo '{"issues":[],"verdict":"pass","summary":"No output"}' > codex-review.json
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-review
+          path: codex-review.json
+
+  # ──────────────────────────────────────────────
+  # Cross-validate (full pipeline only)
+  # ──────────────────────────────────────────────
+  cross-validate:
+    needs: [classify, layer2-claude-review, layer2-codex-review]
+    if: needs.classify.outputs.pipeline_depth == 'full'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: claude-review
+          path: claude-review
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-review
+          path: codex-review
+
+      - name: Extract single-model issues for targeted validation
+        id: extract
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import pathlib
+
+          claude_path = pathlib.Path("claude-review/claude-review.json")
+          codex_path = pathlib.Path("codex-review/codex-review.json")
+          claude_issues = json.loads(claude_path.read_text()).get("issues", []) if claude_path.exists() else []
+          codex_issues = json.loads(codex_path.read_text()).get("issues", []) if codex_path.exists() else []
+
+          def normalize(issue: dict) -> str:
+              return f"{issue['file']}:{issue['line_start']}:{issue['category']}"
+
+          claude_keys = {normalize(issue) for issue in claude_issues}
+          codex_keys = {normalize(issue) for issue in codex_issues}
+
+          targets = []
+          for issue in claude_issues:
+              if normalize(issue) not in codex_keys:
+                  targets.append({**issue, "original_finder": "claude"})
+          for issue in codex_issues:
+              if normalize(issue) not in claude_keys:
+                  targets.append({**issue, "original_finder": "codex"})
+
+          pathlib.Path("single-model-issues.json").write_text(json.dumps(targets, indent=2))
+          print(f"[INFO] {len(targets)} single-model issue(s) need targeted validation")
+          PYEOF
+          COUNT=$(python3 -c "import json; print(len(json.load(open('single-model-issues.json'))))")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Targeted validation via Claude
+        if: steps.extract.outputs.count != '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are a targeted code reviewer. For each issue in single-model-issues.json,
+            determine if the issue is real by examining the actual source code.
+
+            For each issue, output a JSON array of objects:
+            {
+              "file": "<file path>",
+              "line_start": <line number>,
+              "category": "<category>",
+              "original_finder": "claude" or "codex",
+              "verdict": "confirmed" | "denied" | "uncertain"
+            }
+
+            Output ONLY the JSON array, no markdown fences.
+          claude_args: >-
+            --output-format json
+            --model claude-sonnet-4-6
+            --max-turns 3
+
+      - name: Collect targeted validation results
+        run: |
+          mkdir -p targeted-validation
+          if [ -f claude-output.json ]; then
+            jq '.structured_output // .result // []' claude-output.json > targeted-validation/targeted-validation.json 2>/dev/null || \
+              cp claude-output.json targeted-validation/targeted-validation.json
+          else
+            echo "[]" > targeted-validation/targeted-validation.json
+          fi
+
+      - name: Cross validate
+        run: python .github/scripts/cross_validator.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-validated
+          path: cross-validated.json
+
+      - name: Post results as PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('cross-validated.json')) return;
+            const data = JSON.parse(fs.readFileSync('cross-validated.json', 'utf8'));
+            const blocks = data.blocks || [];
+            const warns = data.warns || [];
+
+            if (blocks.length === 0 && warns.length === 0) return;
+
+            let body = '## Cross-validated Review Results\n\n';
+            if (blocks.length > 0) {
+              body += `### ${blocks.length} Blocking Issue(s)\n`;
+              for (const b of blocks) {
+                body += `- **${b.severity}** \`${b.file}:${b.line_start}\` — ${b.description} *(${b.agreement}, conf: ${b.cross_confidence})*\n`;
+              }
+              body += '\n';
+            }
+            if (warns.length > 0) {
+              body += `### ${warns.length} Warning(s)\n`;
+              for (const w of warns) {
+                body += `- **${w.severity}** \`${w.file}:${w.line_start}\` — ${w.description} *(${w.agreement}, conf: ${w.cross_confidence})*\n`;
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });
+
+  # ──────────────────────────────────────────────
+  # Final merge gate (platform-agnostic)
+  # ──────────────────────────────────────────────
+  merge-gate:
+    needs:
+      - classify
+      - deterministic-gates
+      - tests
+      - layer2-claude-review
+      - layer2-codex-review
+      - cross-validate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all gates
+        env:
+          DEPTH: ${{ needs.classify.outputs.pipeline_depth }}
+          GATES: ${{ needs.deterministic-gates.result }}
+          TESTS: ${{ needs.tests.result }}
+          CLAUDE: ${{ needs.layer2-claude-review.result }}
+          CODEX: ${{ needs.layer2-codex-review.result }}
+          CROSS: ${{ needs.cross-validate.result }}
+        run: |
+          set -euo pipefail
+          echo "pipeline_depth=$DEPTH"
+          echo "gates=$GATES tests=$TESTS claude=$CLAUDE codex=$CODEX cross=$CROSS"
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ "$GATES" = "success" ] || fail "Deterministic gates did not succeed (got $GATES)"
+          [ "$TESTS" = "success" ] || fail "Tests did not succeed (got $TESTS)"
+
+          case "$DEPTH" in
+            layer1)
+              ;;
+            claude_only)
+              [ "$CLAUDE" = "success" ] || fail "Claude review required for depth=claude_only (got $CLAUDE)"
+              ;;
+            full)
+              [ "$CLAUDE" = "success" ] || fail "Claude review required for depth=full (got $CLAUDE)"
+              [ "$CODEX" = "success" ] || fail "Codex review required for depth=full (got $CODEX)"
+              [ "$CROSS" = "success" ] || fail "cross-validate required for depth=full (got $CROSS)"
+              ;;
+            *)
+              fail "Unknown pipeline_depth=$DEPTH"
+              ;;
+          esac
+
+          echo "All required gates passed"

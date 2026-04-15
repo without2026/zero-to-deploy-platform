@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Behavior Spec",
+  "description": "Platform-agnostic behavior specification. Used as the oracle for Layer 1 test-vs-code judgment.",
+  "type": "object",
+  "required": ["module", "version", "behaviors"],
+  "properties": {
+    "module": { "type": "string" },
+    "platform": {
+      "type": "string",
+      "enum": ["any", "android", "ios", "desktop", "api"],
+      "default": "any"
+    },
+    "version": { "type": "integer", "minimum": 1 },
+    "behaviors": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/behavior" }
+    },
+    "invariants": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "behavior": {
+      "type": "object",
+      "required": ["id", "type", "description", "precondition", "expected", "source", "tests"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z]+-[0-9]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["api", "ui_interaction", "lifecycle", "permission", "gesture"]
+        },
+        "description": { "type": "string" },
+        "precondition": { "type": "string" },
+        "expected": { "type": "string" },
+        "source": {
+          "type": "string",
+          "enum": [
+            "incident-regression",
+            "phase2-acceptance",
+            "api-schema-validation",
+            "domain-invariant",
+            "review-discovery",
+            "edge-case-review",
+            "regression-guard"
+          ]
+        },
+        "tests": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "endpoint": { "type": "string" },
+        "http_method": { "type": "string" },
+        "request_body": { "type": "string" },
+        "screen": { "type": "string" },
+        "interaction": { "type": "string" },
+        "animation": { "type": "string" },
+        "transition_to": { "type": "string" },
+        "trigger": { "type": "string" },
+        "timeout": { "type": "string" },
+        "background_duration": { "type": "string" },
+        "os_permission": { "type": "string" },
+        "fallback_behavior": { "type": "string" },
+        "gesture": { "type": "string" },
+        "direction": { "type": "string" },
+        "velocity": { "type": "string" },
+        "incident_log": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "api" } } },
+          "then": { "required": ["endpoint"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "ui_interaction" } } },
+          "then": { "required": ["screen", "interaction"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "lifecycle" } } },
+          "then": { "required": ["trigger"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "permission" } } },
+          "then": { "required": ["os_permission"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "gesture" } } },
+          "then": { "required": ["gesture", "screen"] }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}
