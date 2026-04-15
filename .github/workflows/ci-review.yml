@@ -27,7 +27,12 @@ jobs:
   # Classify PR size and determine pipeline depth
   # (Platform-agnostic)
   # ──────────────────────────────────────────────
+  # Guard: ci-review is designed for consumer apps with .pipeline/platform.yml.
+  # When this workflow lives in the platform repo itself (no platform.yml),
+  # skip the entire pipeline. Step 3c converts this to workflow_call-only
+  # so consumer apps invoke it from their own pr.yml caller.
   classify:
+    if: hashFiles('.pipeline/platform.yml') != ''
     runs-on: ubuntu-latest
     outputs:
       loc_changed: ${{ steps.stats.outputs.loc }}

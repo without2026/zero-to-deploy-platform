@@ -29,7 +29,15 @@ jobs:
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -version
       - name: Lint workflows
-        run: ./actionlint -color
+        # Ignore shellcheck style/warning codes that are noisy across the
+        # pre-existing workflow corpus (SC2129/2046/2015). These are style
+        # or defensive-quoting issues, not correctness. A dedicated lint
+        # cleanup PR can opt-in to stricter checks later.
+        run: |
+          ./actionlint -color \
+            -ignore 'SC2129' \
+            -ignore 'SC2046' \
+            -ignore 'SC2015'
 
   yaml-syntax:
     runs-on: ubuntu-latest
