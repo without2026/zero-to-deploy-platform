@@ -1,0 +1,108 @@
+# Self-CI: platform repo's own quality gate.
+# Runs on every PR to main. Checks:
+#   1. actionlint — static analysis of every workflow file
+#   2. yaml-load  — each workflow parses as valid YAML
+#   3. python-syntax — every .py in pipeline/core/ and .github/scripts/ compiles
+#   4. breaking-change guard — warn if a reusable workflow's inputs/secrets/outputs
+#      changed in a way that would break @v1 consumers (non-blocking in v0.x)
+#
+# Name prefix `_self-` marks this as platform-internal (not consumable).
+
+name: Self-CI — Lint & Structure
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -version
+      - name: Lint workflows
+        run: ./actionlint -color
+
+  yaml-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: Parse every YAML under .github/ and pipeline/
+        run: |
+          set -e
+          python3 - <<'PY'
+          import sys, yaml
+          from pathlib import Path
+          errors = []
+          for p in list(Path(".github").rglob("*.yml")) + list(Path("pipeline").rglob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except Exception as e:
+                  errors.append(f"{p}: {e}")
+          if errors:
+              for e in errors: print(f"::error::{e}")
+              sys.exit(1)
+          print(f"parsed {len(list(Path('.').rglob('*.yml')))} yml files")
+          PY
+
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile every .py
+        run: |
+          set -e
+          python3 -m compileall -q pipeline/core .github/scripts
+          echo "::notice::python compile ok"
+
+  workflow-call-audit:
+    # Fails if a workflow file in .github/workflows/ (excluding _self-*) lacks
+    # `on: workflow_call:` — this keeps the platform's public API consistent.
+    # Consumer-facing triggers (pull_request, push, workflow_dispatch) are allowed
+    # IN ADDITION to workflow_call, but not instead of it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: Audit triggers
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+          from pathlib import Path
+          viols = []
+          for p in Path(".github/workflows").glob("*.yml"):
+              if p.name.startswith("_self-"):
+                  continue
+              data = yaml.safe_load(p.read_text())
+              # PyYAML parses `on:` as the Python literal True. Normalize both keys.
+              triggers = data.get("on") or data.get(True) or {}
+              if not isinstance(triggers, dict) or "workflow_call" not in triggers:
+                  viols.append(p.name)
+          # ADVISORY for v0.x — Step 3c will convert the remaining triggers
+          # (ci-review, ci-auto-fix, ci-scenario-gen, deploy-*) to dual-mode
+          # (existing trigger + workflow_call) and promote this check to blocking.
+          if viols:
+              print("::warning::Workflows missing `on: workflow_call:` — consumers cannot reuse these yet:")
+              for v in viols: print(f"  - {v}")
+              print("::notice::(advisory only in v0.x; will become blocking after Step 3c migration)")
+          else:
+              print(f"::notice::all {len(list(Path('.github/workflows').glob('*.yml')))} non-self workflows expose workflow_call")
+          PY

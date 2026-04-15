@@ -10,6 +10,12 @@ SemVer. Major bumps require `BREAKING:` in the PR title and an entry in this fil
 
 ## In progress — toward v0.1.0
 
+### Step 3b (feat/3b-workflow-audit-selfci) — 2026-04-15
+- **Fix** `electron-build.yml` — replaced invalid job-level `if: ... matrix.target` (actionlint expression error) with a dynamic matrix filter: a `setup` job computes the matrix JSON based on `inputs.build_target`, jobs consume via `fromJSON(needs.setup.outputs.matrix)`. This also avoids wasted CI minutes when a single target is selected (previously all 3 runners spun up and checked `if:`).
+- **Fix** `ci-scenario-gen.yml` — plugged CWE-94 script-injection vector: `git push origin HEAD:${{ github.head_ref }}` → passes `github.head_ref` through an `env:` var with regex validation before `git push`. actionlint expression warning cleared.
+- **Add** `.github/workflows/_self-ci-lint.yml` — platform repo's own gate. Runs on every PR + push to main: `actionlint`, yaml-load, python `compileall`, and a `workflow_call` audit that currently emits warnings (will become blocking in Step 3c).
+- Discovered: `pipeline/adapters/<platform>/{build,test,gates,deploy}.yml` files are orphan (no workflow references them). Deferred cleanup to a dedicated legacy-prune PR.
+
 ### Step 3a (feat/3a-adapter-build-android) — 2026-04-15
 - **Add** `.github/workflows/android-build.yml` — `workflow_call`, reads `project_root` from consumer's `.pipeline/platform.yml`, outputs `android-aab` artifact (14-day retention, sha256 sidecar).
 - **Update** `.github/workflows/adapter-build.yml` — now routes `adapter=android` (previously only electron; android was silently unreachable).

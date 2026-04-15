@@ -230,7 +230,16 @@ jobs:
 
       - name: Commit generated tests
         if: steps.extract.outputs.count != '0' && steps.check.outputs.has_changes == 'true'
+        env:
+          # Pass untrusted ref through env to avoid shell injection (CWE-94).
+          # actionlint[expression] enforces this pattern.
+          HEAD_REF: ${{ github.head_ref }}
         run: |
+          # Defensive validation: branch names only contain [A-Za-z0-9._/-].
+          if ! printf '%s' "$HEAD_REF" | grep -qE '^[A-Za-z0-9._/-]+$'; then
+            echo "::error::refusing to push to untrusted head_ref: $HEAD_REF"
+            exit 1
+          fi
           git config user.name "claude-scenario-gen[bot]"
           git config user.email "claude-scenario-gen[bot]@users.noreply.github.com"
           git add -A
@@ -241,7 +250,7 @@ jobs:
           Source: review-discovery. See gen-report.json artifact.
           EOF
           )"
-          git push origin "HEAD:${{ github.head_ref }}"
+          git push origin "HEAD:$HEAD_REF"
 
       - name: Remove missing-tests label
         if: always()
